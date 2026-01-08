@@ -1,0 +1,5 @@
+item,demand,demand description
+motor,datasheet,use when minimum lifetime for bearings inside motor is required. Example L10 requirement 20000 hours.
+motor,drawings,use when general arrangement drawing format according to customer template.
+pump,material,use when customer specifies pump material / wetted parts material.
+pump,tests,use when customer requires pump tests (FAT/SAT or specific test procedure) explicitly.

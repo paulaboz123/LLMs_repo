@@ -1,0 +1,7 @@
+openai==1.40.6
+tenacity==8.5.0
+pandas==2.2.2
+numpy==1.26.4
+orjson==3.10.7
+python-dotenv==1.0.1
+openpyxl==3.1.5
