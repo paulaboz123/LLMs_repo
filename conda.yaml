@@ -1,0 +1,11 @@
+name: openai-rag-demand-labeler
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - openai>=1.0.0
+      - pandas>=2.0.0
+      - numpy>=1.24.0
+      - openpyxl>=3.1.0

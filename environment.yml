@@ -1,0 +1,5 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: openai-rag-demand-labeler-env
+description: OpenAI + RAG PoC environment for Azure ML managed online endpoint.
+image: mcr.microsoft.com/azureml/minimal-ubuntu20.04-py310-cpu-inference:latest
+conda_file: conda.yaml

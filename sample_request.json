@@ -1,0 +1,18 @@
+{
+  "document": {
+    "contentDomain": {
+      "byId": {
+        "chunk_001": {
+          "text": "Motor must be properly earthed/grounded according to local standards."
+        },
+        "chunk_002": {
+          "text": "Supplier shall provide ISO 9001 certificate and documentation upon request."
+        },
+        "chunk_003": {
+          "text": "This paragraph is marketing text and contains no requirements."
+        }
+      }
+    }
+  },
+  "num_preds": 3
+}

@@ -1,0 +1,20 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+name: ${DEPLOYMENT_NAME}
+endpoint_name: ${ENDPOINT_NAME}
+model: null
+code_configuration:
+  code: ../
+  scoring_script: score.py
+environment: azureml:openai-rag-demand-labeler-env@latest
+instance_type: ${INSTANCE_TYPE}
+instance_count: ${INSTANCE_COUNT}
+request_settings:
+  request_timeout_ms: 180000
+  max_concurrent_requests_per_instance: 1
+environment_variables:
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  OPENAI_MODEL: ${OPENAI_MODEL}
+  OPENAI_EMBED_MODEL: ${OPENAI_EMBED_MODEL}
+  RAG_TOPK: "8"
+  MAX_CHUNK_CHARS: "4000"
+  MAX_CHUNKS_PER_DOC: "1000"
