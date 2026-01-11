@@ -28,8 +28,3 @@ environment_variables:
   MAX_LABELS_PER_CHUNK: "3"
   MIN_KEEP_PROBA: "0.30"
   MAX_TEXT_CHARS: "4000"
-
-
-if __name__ == "__main__":
-    main()
-
