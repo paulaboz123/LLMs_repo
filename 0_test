@@ -1,65 +1,34 @@
-import json
-from dotenv import load_dotenv
-load_dotenv()
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+name: llm
+endpoint_name: YOUR_EXISTING_ENDPOINT_NAME
 
-import score
+model: null
 
-TEST_CHUNKS = {
-    "t1_earthing": "Motor frame shall be connected to protective earth (PE). Earthing conductor shall be provided and sized according to IEC 60364.",
-    "t2_eff": "Motor efficiency class shall be IE3 as a minimum according to IEC 60034-30-1.",
-    "t3_vf": "Rated supply shall be 400 V ±10%, 50 Hz. Motor shall be suitable for 460 V, 60 Hz when specified.",
-    "t4_frame": "Motor housing/frame shall be cast iron. Aluminium frame is not acceptable.",
-    "t5_ip": "Minimum degree of protection shall be IP55. For outdoor installation IP66 is required.",
-    "t6_atex": "Motor shall be certified for Zone 2, Gas Group IIC, T3. ATEX marking shall be provided.",
-    "t7_heaters": "Anti-condensation heaters shall be installed and suitable for continuous operation when the motor is stopped.",
-    "t8_bearing": "Bearings L10 life shall be minimum 40,000 hours at rated load and speed.",
-    "t9_lifegrease": "Bearings shall be grease lubricated for life. No regreasing shall be required.",
-    "t10_typetest": "Type test shall be performed and documented in accordance with IEC 60034. Type test report shall be submitted.",
-    "t11_routine": "Routine test report is required for each delivered motor including insulation resistance and no-load current.",
-    "t12_local": "Local start/stop pushbuttons shall be mounted on the motor terminal box (or a local station adjacent to the motor).",
-    "t13_sc": "Motor shall withstand a minimum short-circuit level of 50 kA for 0.2 s at the specified voltage.",
-    "t14_datasheet": "Vendor shall complete and submit the motor datasheet for approval prior to manufacturing.",
-    "t15_drawings": "General arrangement drawings and terminal box orientation drawings shall be submitted for approval.",
-    "t16_paint": "External coating system shall be C3-M per ISO 12944. Color RAL 7035 unless otherwise specified.",
-    "t17_mcs": "Motor shall be controlled from a motor control station with start/stop and emergency stop.",
-    "t18_vfd": "Motor shall be suitable for operation with VFD including insulation class and bearing protection measures.",
-    "t19_vendor": "Only approved motor vendors are acceptable. Vendor shall be ABB or Siemens unless otherwise agreed.",
-    "t20_vibration": "Vibration measurements shall comply with ISO 10816. Test results shall be included in the documentation.",
-    "t21_multi": "For Zone 2 installation motor shall be ATEX certified, minimum IP66, and protective earthing (PE) shall be provided.",
-    "t22_multi": "Motor for VFD duty shall meet minimum bearing lifetime of 40,000 h and vibration shall comply with ISO 10816.",
-    "t23_multi": "Rated 400 V 50 Hz motor. Routine test report and completed datasheet are required prior to shipment.",
-    "n1_ground": "The pump shall be installed on a solid ground foundation.",
-    "n2_ipaddr": "The controller must support static IP addressing.",
-    "n3_latex": "Latex gloves shall be provided.",
-    "n4_verify": "Verification documentation shall be provided.",
-    "n5_iso_file": "ISO file must be mounted before installation.",
-    "t24_pump_mat": "Pump wetted parts shall be AISI 316L stainless steel. Cast iron is not acceptable for the pumped medium.",
-}
+code_configuration:
+  code: .
+  scoring_script: score.py
 
-def main():
-    score.init()
+environment: azureml:openai-rag-demand-labeler-env@latest
 
-    req = {
-        "document": {
-            "contentDomain": {
-                "byId": {cid: {"text": txt} for cid, txt in TEST_CHUNKS.items()}
-            }
-        },
-        "num_preds": 3
-    }
+instance_type: Standard_DS3_v2
+instance_count: 1
 
-    out = score.run(json.dumps(req, ensure_ascii=False))
-    doc = out["predictions"]
-    by_id = doc["contentDomain"]["byId"]
+request_settings:
+  request_timeout_ms: 180000
+  max_concurrent_requests_per_instance: 1
 
-    for cid in TEST_CHUNKS.keys():
-        c = by_id[cid]
-        print("=" * 100)
-        print(cid, "relevantProba:", c.get("relevantProba"))
-        print("text:", TEST_CHUNKS[cid])
-        print("preds:", c.get("cdTransformerPredictions"))
+environment_variables:
+  AZURE_OPENAI_ENDPOINT: "https://<twoj-resource>.openai.azure.com/"
+  AZURE_OPENAI_API_KEY: "<KEY1_LUB_KEY2_Z_AZURE_PORTAL>"
+  AZURE_OPENAI_API_VERSION: "2024-12-01-preview"
+  AZURE_OPENAI_CHAT_DEPLOYMENT: "gpt-5-mini"
+  AZURE_OPENAI_EMBED_DEPLOYMENT: "text-embedding-3-small"
 
-    print("\nDocument demand predictions:", doc.get("documentDemandPredictions"))
+  TOP_K_RAG: "8"
+  MAX_LABELS_PER_CHUNK: "3"
+  MIN_KEEP_PROBA: "0.30"
+  MAX_TEXT_CHARS: "4000"
+
 
 if __name__ == "__main__":
     main()
