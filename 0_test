@@ -28,3 +28,54 @@ environment_variables:
   MAX_LABELS_PER_CHUNK: "3"
   MIN_KEEP_PROBA: "0.30"
   MAX_TEXT_CHARS: "4000"
+
+
+
+###########
+
+az configure --defaults group="<RG>" workspace="<WORKSPACE>"
+az extension add -n ml -y 2>/dev/null || true
+
+az ml environment create -f environment.yml
+
+
+az ml online-deployment create -f deployment.yml
+
+
+az ml online-deployment create -f deployment.yml \
+  --set environment_variables.AZURE_OPENAI_API_KEY="$AZURE_OPENAI_API_KEY"
+
+
+az ml online-deployment get-logs --endpoint-name YOUR_EXISTING_ENDPOINT_NAME --name llm --lines 200
+
+
+SCORING_URI=$(az ml online-endpoint show --name YOUR_EXISTING_ENDPOINT_NAME --query scoring_uri -o tsv)
+ENDPOINT_KEY=$(az ml online-endpoint get-credentials --name YOUR_EXISTING_ENDPOINT_NAME --query primaryKey -o tsv)
+
+
+curl -sS "$SCORING_URI" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ENDPOINT_KEY" \
+  --data-binary @sample_request.json
+
+
+az ml online-endpoint update --name YOUR_EXISTING_ENDPOINT_NAME --traffic "llm=10"
+
+
+az ml online-endpoint update --name YOUR_EXISTING_ENDPOINT_NAME --traffic "llm=100"
+
+
+############3
+
+{
+  "document": {
+    "contentDomain": {
+      "byId": {
+        "c1": {"text": "Motor frame shall be connected to protective earth (PE)."},
+        "c2": {"text": "Minimum degree of protection shall be IP55."},
+        "c3": {"text": "Marketing description only."}
+      }
+    }
+  },
+  "num_preds": 3
+}
