@@ -1,313 +1,66 @@
-# Azure OpenAI resource (Azure Portal -> Keys and Endpoint)
-AZURE_OPENAI_ENDPOINT=https://albotopenai.openai.azure.com/
-AZURE_OPENAI_API_KEY=TU_WKLEJ_KEY1_LUB_KEY2_Z_AZURE_PORTAL
-AZURE_OPENAI_API_VERSION=2024-12-01-preview
-
-# DEPLOYMENT NAMES z Azure OpenAI Studio -> Deployments
-AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-5-mini
-AZURE_OPENAI_EMBED_DEPLOYMENT=text-embedding-3-small
-
-# Optional tuning
-TOP_K_RAG=8
-MAX_LABELS_PER_CHUNK=3
-MIN_KEEP_PROBA=0.30
-MAX_TEXT_CHARS=4000
-
-
-###############
-
 import json
 from dotenv import load_dotenv
 load_dotenv()
 
 import score
 
-score.init()
-
-req = {
-    "document": {
-        "contentDomain": {
-            "byId": {
-                "c1": {"text": "Motor must be properly earthed/grounded according to local regulations."},
-                "c2": {"text": "Supplier shall provide ISO 9001 certificate upon request."},
-                "c3": {"text": "Marketing description only."}
-            }
-        }
-    },
-    "num_preds": 3
+TEST_CHUNKS = {
+    "t1_earthing": "Motor frame shall be connected to protective earth (PE). Earthing conductor shall be provided and sized according to IEC 60364.",
+    "t2_eff": "Motor efficiency class shall be IE3 as a minimum according to IEC 60034-30-1.",
+    "t3_vf": "Rated supply shall be 400 V ±10%, 50 Hz. Motor shall be suitable for 460 V, 60 Hz when specified.",
+    "t4_frame": "Motor housing/frame shall be cast iron. Aluminium frame is not acceptable.",
+    "t5_ip": "Minimum degree of protection shall be IP55. For outdoor installation IP66 is required.",
+    "t6_atex": "Motor shall be certified for Zone 2, Gas Group IIC, T3. ATEX marking shall be provided.",
+    "t7_heaters": "Anti-condensation heaters shall be installed and suitable for continuous operation when the motor is stopped.",
+    "t8_bearing": "Bearings L10 life shall be minimum 40,000 hours at rated load and speed.",
+    "t9_lifegrease": "Bearings shall be grease lubricated for life. No regreasing shall be required.",
+    "t10_typetest": "Type test shall be performed and documented in accordance with IEC 60034. Type test report shall be submitted.",
+    "t11_routine": "Routine test report is required for each delivered motor including insulation resistance and no-load current.",
+    "t12_local": "Local start/stop pushbuttons shall be mounted on the motor terminal box (or a local station adjacent to the motor).",
+    "t13_sc": "Motor shall withstand a minimum short-circuit level of 50 kA for 0.2 s at the specified voltage.",
+    "t14_datasheet": "Vendor shall complete and submit the motor datasheet for approval prior to manufacturing.",
+    "t15_drawings": "General arrangement drawings and terminal box orientation drawings shall be submitted for approval.",
+    "t16_paint": "External coating system shall be C3-M per ISO 12944. Color RAL 7035 unless otherwise specified.",
+    "t17_mcs": "Motor shall be controlled from a motor control station with start/stop and emergency stop.",
+    "t18_vfd": "Motor shall be suitable for operation with VFD including insulation class and bearing protection measures.",
+    "t19_vendor": "Only approved motor vendors are acceptable. Vendor shall be ABB or Siemens unless otherwise agreed.",
+    "t20_vibration": "Vibration measurements shall comply with ISO 10816. Test results shall be included in the documentation.",
+    "t21_multi": "For Zone 2 installation motor shall be ATEX certified, minimum IP66, and protective earthing (PE) shall be provided.",
+    "t22_multi": "Motor for VFD duty shall meet minimum bearing lifetime of 40,000 h and vibration shall comply with ISO 10816.",
+    "t23_multi": "Rated 400 V 50 Hz motor. Routine test report and completed datasheet are required prior to shipment.",
+    "n1_ground": "The pump shall be installed on a solid ground foundation.",
+    "n2_ipaddr": "The controller must support static IP addressing.",
+    "n3_latex": "Latex gloves shall be provided.",
+    "n4_verify": "Verification documentation shall be provided.",
+    "n5_iso_file": "ISO file must be mounted before installation.",
+    "t24_pump_mat": "Pump wetted parts shall be AISI 316L stainless steel. Cast iron is not acceptable for the pumped medium.",
 }
 
-out = score.run(json.dumps(req, ensure_ascii=False))
-print(json.dumps(out, indent=2, ensure_ascii=False))
+def main():
+    score.init()
 
+    req = {
+        "document": {
+            "contentDomain": {
+                "byId": {cid: {"text": txt} for cid, txt in TEST_CHUNKS.items()}
+            }
+        },
+        "num_preds": 3
+    }
 
+    out = score.run(json.dumps(req, ensure_ascii=False))
+    doc = out["predictions"]
+    by_id = doc["contentDomain"]["byId"]
 
-####################
+    for cid in TEST_CHUNKS.keys():
+        c = by_id[cid]
+        print("=" * 100)
+        print(cid, "relevantProba:", c.get("relevantProba"))
+        print("text:", TEST_CHUNKS[cid])
+        print("preds:", c.get("cdTransformerPredictions"))
 
-import os
-import json
-import logging
-import time
-from typing import Any, Dict, List, Optional
+    print("\nDocument demand predictions:", doc.get("documentDemandPredictions"))
 
-import numpy as np
-import pandas as pd
-from openai import AzureOpenAI
+if __name__ == "__main__":
+    main()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# -------------------------
-# Globals (Azure ML style)
-# -------------------------
-client: Optional[AzureOpenAI] = None
-DEMANDS: List[Dict[str, str]] = []
-DEMAND_EMB: Optional[np.ndarray] = None
-
-AZURE_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
-AZURE_EMBED_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "").strip()
-
-TOP_K_RAG = int(os.getenv("TOP_K_RAG", "8"))
-MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))
-MIN_KEEP_PROBA = float(os.getenv("MIN_KEEP_PROBA", "0.30"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "4000"))
-
-
-def _l2_normalize(x: np.ndarray) -> np.ndarray:
-    denom = (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
-    return x / denom
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _safe_json_loads(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def init():
-    """
-    Called once per container start by Azure ML.
-    Loads demands from Excel and embeds them for retrieval.
-    """
-    global client, DEMANDS, DEMAND_EMB, AZURE_CHAT_DEPLOYMENT, AZURE_EMBED_DEPLOYMENT
-
-    logger.info("INIT: starting...")
-
-    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip()
-    api_key = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
-    api_version = (os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview").strip()
-
-    AZURE_CHAT_DEPLOYMENT = (os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or "").strip()
-    AZURE_EMBED_DEPLOYMENT = (os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT") or "").strip()
-
-    if not endpoint or not api_key:
-        logger.error("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY.")
-        return
-    if not AZURE_CHAT_DEPLOYMENT or not AZURE_EMBED_DEPLOYMENT:
-        logger.error("Missing AZURE_OPENAI_CHAT_DEPLOYMENT or AZURE_OPENAI_EMBED_DEPLOYMENT.")
-        return
-
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
-    # ---- Load demands.xlsx
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    demands_path = os.path.join(base_dir, "demands.xlsx")
-
-    if not os.path.exists(demands_path):
-        logger.error(f"demands.xlsx not found at: {demands_path}")
-        return
-
-    df = pd.read_excel(demands_path)
-
-    # Your Excel columns: demand_id, demand, description
-    required_cols = {"demand_id", "demand", "description"}
-    if not required_cols.issubset(df.columns):
-        logger.error(f"demands.xlsx missing columns. Required: {required_cols}, got: {set(df.columns)}")
-        return
-
-    DEMANDS = []
-    embed_inputs: List[str] = []
-
-    for _, row in df.iterrows():
-        did = str(row["demand_id"]).strip()
-        name = str(row["demand"]).strip()
-        desc = str(row["description"]).strip()
-
-        if not did or did.lower() == "nan":
-            continue
-        if not name or name.lower() == "nan":
-            continue
-
-        DEMANDS.append({"id": did, "name": name, "description": desc})
-        embed_inputs.append(f"Name: {name}\nClarification: {desc}")
-
-    if not DEMANDS:
-        logger.error("No demands loaded from Excel (DEMANDS is empty).")
-        return
-
-    # ---- Embed demands once
-    t0 = time.time()
-    emb = client.embeddings.create(
-        model=AZURE_EMBED_DEPLOYMENT,  # Azure: model == DEPLOYMENT NAME
-        input=embed_inputs
-    )
-    DEMAND_EMB = _l2_normalize(np.array([e.embedding for e in emb.data], dtype=np.float32))
-
-    logger.info(f"INIT: loaded {len(DEMANDS)} demands. Embedding time: {time.time() - t0:.2f}s")
-
-
-def _retrieve_candidates(chunk_text: str, k: int) -> List[Dict[str, str]]:
-    if client is None or DEMAND_EMB is None or not DEMANDS:
-        return []
-
-    emb = client.embeddings.create(
-        model=AZURE_EMBED_DEPLOYMENT,
-        input=[chunk_text]
-    )
-    q = _l2_normalize(np.array([emb.data[0].embedding], dtype=np.float32))
-    sims = DEMAND_EMB @ q[0]
-    idx = np.argsort(-sims)[:k]
-    return [DEMANDS[i] for i in idx]
-
-
-def _llm_classify_chunk(chunk_id: str, chunk_text: str, candidates: List[Dict[str, str]]) -> Dict[str, Any]:
-    if client is None:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "AzureOpenAI client not initialized."}
-
-    if not candidates:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "No candidates from retrieval."}
-
-    demands_context = "\n".join(
-        [f"- id: {d['id']}\n  name: {d['name']}\n  clarification: {d['description']}" for d in candidates]
-    )
-
-    system = (
-        "You label customer requirements in product documentation.\n"
-        "You MUST only choose from the provided demands.\n"
-        "Match ONLY when the chunk clearly satisfies the demand's clarification.\n"
-        "Return at most 3 demands.\n"
-        "If nothing matches, return an empty demandIds array.\n"
-        "Probabilities must be in [0.0, 1.0].\n"
-        "Return JSON only."
-    )
-
-    user = f"""
-Demands (id, name, clarification):
-{demands_context}
-
-ChunkId: {chunk_id}
-Chunk text:
-{chunk_text}
-
-Return JSON in this format exactly:
-{{
-  "chunkId": "{chunk_id}",
-  "demandIds": [{{"id":"<one of provided ids>","probability":0.85}}],
-  "explanation": "brief reason"
-}}
-""".strip()
-
-    try:
-        resp = client.chat.completions.create(
-            model=AZURE_CHAT_DEPLOYMENT,  # Azure: model == DEPLOYMENT NAME
-            temperature=0,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        content = resp.choices[0].message.content or ""
-        parsed = _safe_json_loads(content)
-        if not parsed:
-            return {"chunkId": chunk_id, "demandIds": [], "explanation": "LLM returned non-JSON."}
-        return parsed
-    except Exception as e:
-        logger.exception("LLM classify failed")
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": f"LLM error: {str(e)}"}
-
-
-def run(raw_data: Any) -> Dict[str, Any]:
-    """
-    Azure ML Online Endpoint entrypoint.
-
-    Input:
-      { "document": { "contentDomain": { "byId": {chunkId:{text:"..."}}}}, "num_preds": 3 }
-
-    Output:
-      { "predictions": <document> }  with per-chunk updates:
-        - relevantProba
-        - cdLogregPredictions (empty list)
-        - cdTransformerPredictions (list of {label, proba})
-      and document-level:
-        - documentDemandPredictions
-    """
-    try:
-        request = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-        if not isinstance(request, dict):
-            raise ValueError("Request must be a JSON object/dict.")
-
-        if "document" not in request or "num_preds" not in request:
-            raise ValueError("Invalid input: expected 'document' and 'num_preds'.")
-
-        document = request["document"]
-        num_pred = int(request["num_preds"])
-
-        by_id = document.get("contentDomain", {}).get("byId", {})
-        if not isinstance(by_id, dict):
-            raise ValueError("document.contentDomain.byId must be an object/dict.")
-
-        document_demand_predictions = set()
-
-        for chunk_id, content in by_id.items():
-            text = str(content.get("text", "") or "")[:MAX_TEXT_CHARS]
-
-            # fail-soft if init() not OK
-            if client is None or DEMAND_EMB is None or not DEMANDS:
-                content.update({
-                    "relevantProba": 0.0,
-                    "cdLogregPredictions": [],
-                    "cdTransformerPredictions": [],
-                })
-                continue
-
-            candidates = _retrieve_candidates(text, TOP_K_RAG)
-            llm_out = _llm_classify_chunk(chunk_id, text, candidates)
-
-            preds = []
-            for item in (llm_out.get("demandIds", []) or [])[:MAX_LABELS_PER_CHUNK]:
-                did = str(item.get("id", "")).strip()
-                proba = _safe_float(item.get("probability", 0.0))
-                if did and proba >= MIN_KEEP_PROBA:
-                    preds.append({"label": did, "proba": proba})
-                    document_demand_predictions.add(did)
-
-            preds = sorted(preds, key=lambda x: x["proba"], reverse=True)[:num_pred]
-            relevant_proba = max([p["proba"] for p in preds], default=0.0)
-
-            content.update({
-                "relevantProba": relevant_proba,
-                "cdLogregPredictions": [],
-                "cdTransformerPredictions": preds,
-            })
-
-        document["documentDemandPredictions"] = list(document_demand_predictions)
-        return {"predictions": document}
-
-    except ValueError as ve:
-        logger.warning(f"Bad request: {str(ve)}")
-        raise
-    except Exception:
-        logger.exception("Internal server error")
-        raise Exception("Internal server error")
