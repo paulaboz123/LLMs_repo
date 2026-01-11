@@ -286,3 +286,4 @@ req = {
 out = score.run(json.dumps(req))
 print(json.dumps(out, indent=2))
 
+python local_test.py
