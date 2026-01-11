@@ -255,3 +255,34 @@ def run(raw_data: Any) -> Dict[str, Any]:
         logger.exception("Internal server error")
         raise Exception("Internal server error")
 
+
+
+
+###############################3
+test
+
+
+import json
+from dotenv import load_dotenv
+load_dotenv()
+
+import score
+
+score.init()
+
+req = {
+  "document": {
+    "contentDomain": {
+      "byId": {
+        "c1": {"text": "Motor must be properly earthed/grounded according to local regulations."},
+        "c2": {"text": "Supplier shall provide ISO 9001 certificate upon request."},
+        "c3": {"text": "Marketing description only."}
+      }
+    }
+  },
+  "num_preds": 3
+}
+
+out = score.run(json.dumps(req))
+print(json.dumps(out, indent=2))
+
