@@ -1,0 +1,281 @@
+3️⃣ .env
+OPENAI_API_KEY=TU_WSTAW_SWÓJ_KLUCZ
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_EMBED_MODEL=text-embedding-3-small
+
+4️⃣ local_test.py ✅ TEN PLIK TWORZYSZ TERAZ
+import json
+
+# Załaduj .env (opcjonalnie, ale polecane)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import score
+
+
+def main():
+    print(">>> INIT")
+    score.init()
+
+    print(">>> RUN")
+
+    request = {
+        "document": {
+            "contentDomain": {
+                "byId": {
+                    "chunk_001": {
+                        "text": "Motor must be properly earthed and grounded according to local regulations."
+                    },
+                    "chunk_002": {
+                        "text": "Supplier shall provide ISO 9001 certificate upon request."
+                    },
+                    "chunk_003": {
+                        "text": "This is marketing text without requirements."
+                    }
+                }
+            }
+        },
+        "num_preds": 3
+    }
+
+    result = score.run(json.dumps(request, ensure_ascii=False))
+
+    print("\n>>> RESULT")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+
+
+score.py
+import os
+import json
+import logging
+from typing import Dict, Any, List
+
+import numpy as np
+import pandas as pd
+from openai import OpenAI
+
+# -------------------------------------------------
+# Logging
+# -------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------
+# Globals (Azure ML style)
+# -------------------------------------------------
+client = None
+DEMANDS: List[Dict[str, str]] = []
+DEMAND_EMB: np.ndarray | None = None
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+
+TOP_K = 5
+MAX_LABELS = 3
+MIN_PROBA = 0.3
+MAX_TEXT_CHARS = 4000
+
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def _l2_normalize(x: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / norm
+
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _safe_json_loads(s: str) -> dict | None:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+# -------------------------------------------------
+# INIT (called once by Azure ML)
+# -------------------------------------------------
+def init():
+    global client, DEMANDS, DEMAND_EMB
+
+    logger.info("INIT started")
+
+    # ---- OpenAI client
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.error("OPENAI_API_KEY missing")
+        return
+
+    client = OpenAI(api_key=api_key)
+
+    # ---- Load demands.xlsx
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    demands_path = os.path.join(base_dir, "demands.xlsx")
+
+    if not os.path.exists(demands_path):
+        logger.error("demands.xlsx not found")
+        return
+
+    df = pd.read_excel(demands_path)
+
+    required_cols = {"demand_id", "demand", "demand_description"}
+    if not required_cols.issubset(df.columns):
+        logger.error(f"Missing columns in demands.xlsx: {required_cols}")
+        return
+
+    DEMANDS = []
+    texts = []
+
+    for _, row in df.iterrows():
+        did = str(row["demand_id"]).strip()
+        name = str(row["demand"]).strip()
+        desc = str(row["demand_description"]).strip()
+
+        if not did or not name:
+            continue
+
+        DEMANDS.append({
+            "id": did,
+            "name": name,
+            "description": desc
+        })
+        texts.append(f"{name}. {desc}")
+
+    if not DEMANDS:
+        logger.error("No demands loaded")
+        return
+
+    # ---- Embed demands
+    emb = client.embeddings.create(
+        model=OPENAI_EMBED_MODEL,
+        input=texts
+    )
+
+    DEMAND_EMB = _l2_normalize(
+        np.array([e.embedding for e in emb.data], dtype=np.float32)
+    )
+
+    logger.info(f"INIT done. Loaded {len(DEMANDS)} demands.")
+
+
+# -------------------------------------------------
+# RAG helpers
+# -------------------------------------------------
+def _top_k_demands(text: str, k: int) -> List[Dict[str, str]]:
+    if DEMAND_EMB is None:
+        return []
+
+    emb = client.embeddings.create(
+        model=OPENAI_EMBED_MODEL,
+        input=[text]
+    )
+
+    q = _l2_normalize(
+        np.array([emb.data[0].embedding], dtype=np.float32)
+    )
+
+    sims = DEMAND_EMB @ q[0]
+    idx = np.argsort(-sims)[:k]
+
+    return [DEMANDS[i] for i in idx]
+
+
+def _llm_score(chunk_id: str, text: str, candidates: List[Dict[str, str]]) -> dict:
+    if not candidates:
+        return {"chunkId": chunk_id, "demandIds": [], "explanation": ""}
+
+    demands_txt = "\n".join(
+        f"- {d['id']}: {d['description']}" for d in candidates
+    )
+
+    prompt = f"""
+You analyze product documentation chunks.
+
+Match ONLY if the text clearly satisfies the requirement description.
+
+Text:
+{text}
+
+Possible demands:
+{demands_txt}
+
+Return JSON ONLY:
+{{
+  "chunkId": "{chunk_id}",
+  "demandIds": [
+    {{"id": "demand_id", "probability": 0.8}}
+  ],
+  "explanation": "short reason"
+}}
+"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return _safe_json_loads(resp.choices[0].message.content) or {
+        "chunkId": chunk_id,
+        "demandIds": [],
+        "explanation": ""
+    }
+
+
+# -------------------------------------------------
+# RUN (called per request by Azure ML)
+# -------------------------------------------------
+def run(raw_data: str | dict) -> dict:
+    try:
+        request = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+        document = request.get("document", {})
+        num_preds = int(request.get("num_preds", 3))
+
+        by_id = document.get("contentDomain", {}).get("byId", {})
+
+        document_demands = set()
+
+        for chunk_id, content in by_id.items():
+            text = (content.get("text") or "")[:MAX_TEXT_CHARS]
+
+            candidates = _top_k_demands(text, TOP_K)
+            result = _llm_score(chunk_id, text, candidates)
+
+            preds = []
+            for d in result.get("demandIds", []):
+                proba = _safe_float(d.get("probability"))
+                if proba >= MIN_PROBA:
+                    preds.append({
+                        "label": d["id"],
+                        "proba": proba
+                    })
+                    document_demands.add(d["id"])
+
+            preds = sorted(preds, key=lambda x: x["proba"], reverse=True)[:num_preds]
+
+            content.update({
+                "relevantProba": max([p["proba"] for p in preds], default=0.0),
+                "cdLogregPredictions": [],
+                "cdTransformerPredictions": preds
+            })
+
+        document["documentDemandPredictions"] = list(document_demands)
+        return {"predictions": document}
+
+    except Exception as e:
+        logger.exception("RUN failed")
+        return {"predictions": {}}
+
