@@ -1,0 +1,43 @@
+# Core Python / data
+numpy>=1.24.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+
+# OpenAI
+openai>=1.0.0
+
+# Azure ML / Azure auth (SDK v2)
+azure-ai-ml>=1.12.0
+azure-identity>=1.15.0
+azure-core>=1.29.0
+
+# Utils (bezpieczne, często potrzebne)
+pyyaml>=6.0.1
+requests>=2.31.0
+
+
+name: openai-rag-demand-labeler
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Core
+      - numpy>=1.24.0
+      - pandas>=2.0.0
+      - openpyxl>=3.1.0
+      - python-dotenv>=1.0.0
+
+      # OpenAI
+      - openai>=1.0.0
+
+      # Azure ML runtime deps (bez starego azureml-sdk)
+      - azure-ai-ml>=1.12.0
+      - azure-identity>=1.15.0
+      - azure-core>=1.29.0
+
+      # Utils
+      - pyyaml>=6.0.1
+      - requests>=2.31.0
