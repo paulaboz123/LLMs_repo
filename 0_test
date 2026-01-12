@@ -1,77 +1,34 @@
-ws = ml_client.workspaces.get(WORKSPACE_NAME)
-print("Workspace:", ws.name, "| location:", ws.location)
+from azure.core.exceptions import HttpResponseError
 
-# 2) Confirm endpoint exists + type
-endpoint = ml_client.online_endpoints.get(ENDPOINT_NAME)
-print("Endpoint:", endpoint.name, "| state:", endpoint.provisioning_state, "| traffic:", endpoint.traffic)
-print("Endpoint type:", type(endpoint))
+print("=== Deployment status ===")
+dep = ml_client.online_deployments.get(name=NEW_DEPLOYMENT, endpoint_name=ENDPOINT_NAME)
+print("name:", dep.name)
+print("provisioning_state:", dep.provisioning_state)
+print("instance_type:", getattr(dep, "instance_type", None))
+print("environment:", getattr(dep, "environment", None))
 
-# 3) Local file checks
-score_path = pathlib.Path(CODE_DIR, SCORING_SCRIPT)
-xlsx_path  = pathlib.Path(CODE_DIR, "demands.xlsx")
-conda_path = pathlib.Path(CODE_DIR, CONDA_FILE)
-
-print("score.py exists:", score_path.exists(), "|", score_path.resolve())
-print("demands.xlsx exists:", xlsx_path.exists(), "|", xlsx_path.resolve())
-print("conda_env.yml exists:", conda_path.exists(), "|", conda_path.resolve())
-
-if not score_path.exists():
-    raise FileNotFoundError(f"Missing {score_path} (fix CODE_DIR / SCORING_SCRIPT)")
-if not xlsx_path.exists():
-    raise FileNotFoundError(f"Missing {xlsx_path} (demands.xlsx must be next to score.py in CODE_DIR)")
-if not conda_path.exists():
-    raise FileNotFoundError(f"Missing {conda_path} (fix CONDA_FILE path)")
-
-# 4) Register/update Environment and capture concrete version
-env = Environment(
-    name=ENV_NAME,
-    description="PoC env for Azure OpenAI + pandas/openpyxl",
-    image="mcr.microsoft.com/azureml/minimal-ubuntu20.04-py310-cpu-inference:latest",
-    conda_file=str(conda_path),
-)
-
-env = ml_client.environments.create_or_update(env)
-print("Environment registered:", env.name, "| version:", env.version)
-
-# 5) Create deployment (Managed)
-deployment = ManagedOnlineDeployment(
-    name=NEW_DEPLOYMENT,
-    endpoint_name=ENDPOINT_NAME,
-    environment=f"azureml:{ENV_NAME}:{env.version}",  # IMPORTANT: use concrete version (avoid @latest)
-    code_configuration=CodeConfiguration(code=CODE_DIR, scoring_script=SCORING_SCRIPT),
-    instance_type=INSTANCE_TYPE,
-    instance_count=INSTANCE_COUNT,
-    environment_variables=ENV_VARS,
-    request_settings=OnlineRequestSettings(request_timeout_ms=180000),
-)
-
-print("Creating deployment:", NEW_DEPLOYMENT, "under endpoint:", deployment.endpoint_name)
-
+print("\n=== Container logs (last 400 lines) ===")
 try:
-    poller = ml_client.online_deployments.begin_create_or_update(deployment)
-    result = poller.result()
-    print("DEPLOYMENT OK:", result.name, "| state:", result.provisioning_state)
+    logs = ml_client.online_deployments.get_logs(
+        name=NEW_DEPLOYMENT,
+        endpoint_name=ENDPOINT_NAME,
+        lines=400
+    )
+    print(logs)
 except HttpResponseError as e:
-    print("\n=== DEPLOYMENT FAILED (HttpResponseError) ===")
-    print("Status:", getattr(e, "status_code", None))
-    print("Message:", str(e))
-    if getattr(e, "response", None) is not None:
-        try:
-            print("\n--- Response JSON ---")
-            print(json.dumps(e.response.json(), indent=2))
-        except Exception:
-            try:
-                print("\n--- Response text ---")
-                print(e.response.text())
-            except Exception:
-                pass
+    print("Could not fetch logs:", e)
     raise
 
-print("\nIf deployment is running but app errors later, fetch logs with:")
-print(f"ml_client.online_deployments.get_logs(name='{NEW_DEPLOYMENT}', endpoint_name='{ENDPOINT_NAME}', lines=200)")
+################3
 
+import pathlib
+print(pathlib.Path(CODE_DIR, "demands.xlsx").resolve(), pathlib.Path(CODE_DIR, "demands.xlsx").exists())
 
-######
+#####
+- openpyxl>=3.1.0
+
+#####
+
 
 endpoint = ml_client.online_endpoints.get(ENDPOINT_NAME)
 endpoint.traffic = {NEW_DEPLOYMENT: 10}  # lub 100
