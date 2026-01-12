@@ -1,36 +1,262 @@
-from azure.core.exceptions import HttpResponseError
+import os
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional
 
-print("=== Deployment status ===")
-dep = ml_client.online_deployments.get(name=NEW_DEPLOYMENT, endpoint_name=ENDPOINT_NAME)
-print("name:", dep.name)
-print("provisioning_state:", dep.provisioning_state)
-print("instance_type:", getattr(dep, "instance_type", None))
-print("environment:", getattr(dep, "environment", None))
+import numpy as np
+import pandas as pd
+from openai import AzureOpenAI
 
-print("\n=== Container logs (last 400 lines) ===")
-try:
-    logs = ml_client.online_deployments.get_logs(
-        name=NEW_DEPLOYMENT,
-        endpoint_name=ENDPOINT_NAME,
-        lines=400
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Globals initialized in init() ---
+client: Optional[AzureOpenAI] = None
+DEMANDS: List[Dict[str, str]] = []
+DEMAND_EMB: Optional[np.ndarray] = None
+
+# --- Env config ---
+AZURE_CHAT_DEPLOYMENT = (os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or "").strip()
+AZURE_EMBED_DEPLOYMENT = (os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT") or "").strip()
+AZURE_OPENAI_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip()
+AZURE_OPENAI_API_KEY = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
+AZURE_OPENAI_API_VERSION = (os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview").strip()
+
+TOP_K_RAG = int(os.getenv("TOP_K_RAG", "8"))
+MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))
+MIN_KEEP_PROBA = float(os.getenv("MIN_KEEP_PROBA", "0.30"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "4000"))
+
+
+def _l2_normalize(x: np.ndarray) -> np.ndarray:
+    denom = (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+    return x / denom
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_json_loads(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def init():
+    """
+    Called once per container start by Azure ML.
+    Loads demands from Excel and embeds them for retrieval.
+    """
+    global client, DEMANDS, DEMAND_EMB
+
+    logger.info("INIT: starting...")
+
+    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY:
+        raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY env vars.")
+
+    if not AZURE_CHAT_DEPLOYMENT or not AZURE_EMBED_DEPLOYMENT:
+        raise RuntimeError("Missing AZURE_OPENAI_CHAT_DEPLOYMENT or AZURE_OPENAI_EMBED_DEPLOYMENT env vars.")
+
+    client = AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
     )
-    print(logs)
-except HttpResponseError as e:
-    print("Could not fetch logs:", e)
-    raise
 
-################3
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    demands_path = os.path.join(base_dir, "demands.xlsx")
+    if not os.path.exists(demands_path):
+        raise FileNotFoundError(f"demands.xlsx not found at: {demands_path}")
 
-import pathlib
-print(pathlib.Path(CODE_DIR, "demands.xlsx").resolve(), pathlib.Path(CODE_DIR, "demands.xlsx").exists())
+    df = pd.read_excel(demands_path)
 
-#####
-- openpyxl>=3.1.0
+    required_cols = {"demand_id", "demand", "description"}
+    if not required_cols.issubset(df.columns):
+        raise RuntimeError(f"demands.xlsx missing columns. Required: {required_cols}, got: {set(df.columns)}")
 
-#####
+    DEMANDS = []
+    embed_inputs: List[str] = []
+
+    for _, row in df.iterrows():
+        did = str(row["demand_id"]).strip()
+        name = str(row["demand"]).strip()
+        desc = str(row["description"]).strip()
+
+        if not did or did.lower() == "nan":
+            continue
+        if not name or name.lower() == "nan":
+            continue
+
+        DEMANDS.append({"id": did, "name": name, "description": desc})
+        embed_inputs.append(f"Name: {name}\nClarification: {desc}")
+
+    if not DEMANDS:
+        raise RuntimeError("No demands loaded from Excel (DEMANDS is empty).")
+
+    t0 = time.time()
+    emb = client.embeddings.create(
+        model=AZURE_EMBED_DEPLOYMENT,
+        input=embed_inputs
+    )
+    DEMAND_EMB = _l2_normalize(np.array([e.embedding for e in emb.data], dtype=np.float32))
+    logger.info(f"INIT: loaded {len(DEMANDS)} demands. Embedding time: {time.time() - t0:.2f}s")
 
 
-endpoint = ml_client.online_endpoints.get(ENDPOINT_NAME)
-endpoint.traffic = {NEW_DEPLOYMENT: 10}  # lub 100
-ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+def _retrieve_candidates(chunk_text: str, k: int) -> List[Dict[str, str]]:
+    if client is None or DEMAND_EMB is None or not DEMANDS:
+        return []
+
+    emb = client.embeddings.create(
+        model=AZURE_EMBED_DEPLOYMENT,
+        input=[chunk_text]
+    )
+    q = _l2_normalize(np.array([emb.data[0].embedding], dtype=np.float32))
+    sims = DEMAND_EMB @ q[0]
+    idx = np.argsort(-sims)[:k]
+    return [DEMANDS[i] for i in idx]
+
+
+def _llm_classify_chunk(chunk_id: str, chunk_text: str, candidates: List[Dict[str, str]]) -> Dict[str, Any]:
+    if client is None:
+        return {"chunkId": chunk_id, "demandIds": [], "explanation": "AzureOpenAI client not initialized."}
+
+    if not candidates:
+        return {"chunkId": chunk_id, "demandIds": [], "explanation": "No candidates from retrieval."}
+
+    demands_context = "\n".join(
+        [f"- id: {d['id']}\n  name: {d['name']}\n  clarification: {d['description']}" for d in candidates]
+    )
+
+    system = (
+        "You label customer requirements in product documentation.\n"
+        "You MUST only choose from the provided demands.\n"
+        "Match ONLY when the chunk clearly satisfies the demand's clarification.\n"
+        "Return at most 3 demands.\n"
+        "If nothing matches, return an empty demandIds array.\n"
+        "Probabilities must be in [0.0, 1.0].\n"
+        "Return JSON only."
+    )
+
+    user = f"""
+Demands (id, name, clarification):
+{demands_context}
+
+ChunkId: {chunk_id}
+Chunk text:
+{chunk_text}
+
+Return JSON in this format exactly:
+{{
+  "chunkId": "{chunk_id}",
+  "demandIds": [{{"id":"<one of provided ids>","probability":0.85}}],
+  "explanation": "brief reason"
+}}
+""".strip()
+
+    # IMPORTANT: część wdrożeń Azure odrzuca temperature=0; nie ustawiamy temperature.
+    resp = client.chat.completions.create(
+        model=AZURE_CHAT_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+
+    content = resp.choices[0].message.content or ""
+    parsed = _safe_json_loads(content)
+    if not parsed:
+        return {"chunkId": chunk_id, "demandIds": [], "explanation": "LLM returned non-JSON."}
+    return parsed
+
+
+def _pad_predictions(preds: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    """
+    Ensures list has exactly n items.
+    Pads with empty predictions so downstream code that indexes [0] won't crash.
+    """
+    preds = preds[:n]
+    while len(preds) < n:
+        preds.append({"label": "", "proba": 0.0})
+    return preds
+
+
+def run(raw_data: Any) -> Dict[str, Any]:
+    """
+    Azure ML Online Endpoint entrypoint.
+
+    Expects:
+      { "document": <doc>, "num_preds": 3 }
+
+    Returns:
+      <doc>  (NOT wrapped), with:
+        - per chunk: relevantProba, cdLogregPredictions, cdTransformerPredictions
+        - doc: documentDemandPredictions
+    """
+    request = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+    if not isinstance(request, dict):
+        raise ValueError("Request must be a JSON object/dict.")
+
+    if "document" not in request or "num_preds" not in request:
+        raise ValueError("Invalid input: expected 'document' and 'num_preds'.")
+
+    document = request["document"]
+    num_pred = int(request["num_preds"])
+
+    by_id = document.get("contentDomain", {}).get("byId", {})
+    if not isinstance(by_id, dict):
+        raise ValueError("document.contentDomain.byId must be an object/dict.")
+
+    document_demand_predictions = set()
+
+    for chunk_id, content in by_id.items():
+        text = str(content.get("text", "") or "")[:MAX_TEXT_CHARS]
+
+        # Default safe outputs (never crash app)
+        relevant_proba = 0.0
+        cd_transformer_preds: List[Dict[str, Any]] = []
+        cd_logreg_preds: List[Dict[str, Any]] = []
+
+        if client is not None and DEMAND_EMB is not None and DEMANDS:
+            candidates = _retrieve_candidates(text, TOP_K_RAG)
+            llm_out = _llm_classify_chunk(chunk_id, text, candidates)
+
+            tmp = []
+            for item in (llm_out.get("demandIds", []) or [])[:MAX_LABELS_PER_CHUNK]:
+                did = str(item.get("id", "")).strip()
+                proba = _safe_float(item.get("probability", 0.0))
+                if did and proba >= MIN_KEEP_PROBA:
+                    tmp.append({"label": did, "proba": proba})
+                    document_demand_predictions.add(did)
+
+            tmp = sorted(tmp, key=lambda x: x["proba"], reverse=True)
+            relevant_proba = tmp[0]["proba"] if tmp else 0.0
+
+            # IMPORTANT: keep schema stable and non-empty lists if app indexes [0]
+            cd_transformer_preds = _pad_predictions(tmp, num_pred)
+
+            # We no longer have logreg; we provide a compatible placeholder list
+            # so downstream indexing won't crash.
+            cd_logreg_preds = _pad_predictions(tmp, num_pred)
+
+        else:
+            cd_transformer_preds = _pad_predictions([], num_pred)
+            cd_logreg_preds = _pad_predictions([], num_pred)
+
+        content.update({
+            "relevantProba": float(relevant_proba),
+            "cdLogregPredictions": cd_logreg_preds,
+            "cdTransformerPredictions": cd_transformer_preds,
+        })
+
+    document["documentDemandPredictions"] = list(document_demand_predictions)
+
+    # CRITICAL: return document directly (old behavior)
+    return document
+
 
