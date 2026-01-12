@@ -1,17 +1,32 @@
-# 1) Pobierz endpoint
-ep = ml_client.online_endpoints.get(ENDPOINT_NAME)
-print("Current traffic:", ep.traffic)
+import json
+import os
 
-# 2) Ustaw traffic na inny deployment (np. 100% na new-deploy)
-ep.traffic = {DEPLOYMENT_TARGET: 100}
-poller = ml_client.online_endpoints.begin_create_or_update(ep)
-poller.result()
-print("Updated traffic:", ml_client.online_endpoints.get(ENDPOINT_NAME).traffic)
+os.environ["USE_MOCK"] = "1"  # test kontraktu bez OpenAI
 
-# 3) Dopiero teraz usuń stary deployment
-del_poller = ml_client.online_deployments.begin_delete(
-    name=DEPLOYMENT_TO_REMOVE,
-    endpoint_name=ENDPOINT_NAME,
-)
-del_poller.result()
-print("Deleted:", DEPLOYMENT_TO_REMOVE)
+import score  # score.py
+
+def main():
+    score.init()
+
+    payload = {
+        "document": {
+            "contentDomain": {
+                "byId": {
+                    "c1": {"id": "c1", "text": "Supplier shall provide ISO 9001 and ISO 14001 certificates."},
+                    "c2": {"id": "c2", "text": "Warranty period shall be at least 24 months from delivery."},
+                    "c3": {"id": "c3", "text": "Installation shall be performed according to the installation manual."},
+                    "c4": {"id": "c4", "text": "Table of contents."},
+                    "c5": {"id": "c5", "text": "Ingress protection class IP55 is required."},
+                    "c6": {"id": "c6", "text": "Delivery shall be DDP including customs clearance."},
+                }
+            }
+        },
+        "model": "WheShe",
+        "num_preds": 3
+    }
+
+    out = score.run(json.dumps(payload))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
