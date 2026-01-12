@@ -1,15 +1,270 @@
-azureml-inference-server-http==0.8.4
-flask==2.2.5
-werkzeug==2.2.3
+import json
+import logging
+import os
+import time
+from typing import Any, Dict, List, Tuple
 
-dependencies:
-  - python=3.10
-  - pip
-  - pip:
-      - azureml-inference-server-http==0.8.4
-      - flask==2.2.5
-      - werkzeug==2.2.3
-      - openai>=1.0.0
-      - pandas
-      - numpy
-      - openpyxl
+import pandas as pd
+from openai import AzureOpenAI
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("score")
+
+# Globals initialized in init()
+client: AzureOpenAI = None
+CHAT_DEPLOYMENT: str = None
+DEMANDS: List[Dict[str, str]] = []  # [{id, demand, description}, ...]
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def _get_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
+
+def _safe_get_content_items(document: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract content items from document["contentDomain"]["byId"].values()
+    Returns list of dicts (each is a mutable reference to original content dict).
+    """
+    cd = document.get("contentDomain", {})
+    by_id = cd.get("byId", {})
+    if isinstance(by_id, dict):
+        return list(by_id.values())
+    return []
+
+def _load_demands_xlsx() -> List[Dict[str, str]]:
+    """
+    Loads demands from an Excel shipped with the code, or from model dir if you placed it there.
+    Expected columns: demand_id, demand, description
+    """
+    # 1) try same directory as score.py
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "demands.xlsx"),
+        os.path.join(here, "assets", "demands.xlsx"),
+    ]
+
+    # 2) try AZUREML_MODEL_DIR (if you attached it as "model artifact" too)
+    model_dir = os.getenv("AZUREML_MODEL_DIR")
+    if model_dir:
+        candidates.extend([
+            os.path.join(model_dir, "demands.xlsx"),
+            os.path.join(model_dir, "assets", "demands.xlsx"),
+        ])
+
+    for path in candidates:
+        if os.path.exists(path):
+            df = pd.read_excel(path)
+            # normalize column names
+            df.columns = [c.strip().lower() for c in df.columns]
+            required = {"demand_id", "demand", "description"}
+            missing = required - set(df.columns)
+            if missing:
+                raise RuntimeError(f"demands.xlsx missing columns: {missing}. Found: {list(df.columns)}")
+
+            rows = []
+            for _, r in df.iterrows():
+                rows.append({
+                    "id": str(r["demand_id"]).strip(),
+                    "demand": str(r["demand"]).strip(),
+                    "description": str(r["description"]).strip(),
+                })
+            logger.info(f"Loaded {len(rows)} demands from: {path}")
+            return rows
+
+    raise RuntimeError(f"demands.xlsx not found in candidates: {candidates}")
+
+def _llm_predict_for_text(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Returns:
+      relevant_proba: float 0..1
+      preds: list of {label: demand_id, proba: float}
+    """
+    # Hard guard for empty/garbage
+    t = (text or "").strip()
+    if len(t) < 3:
+        return 0.0, []
+
+    # Keep prompt compact but deterministic
+    # IMPORTANT: do NOT pass temperature=0 if your model/deployment forbids it (you already hit that error).
+    system = (
+        "You classify whether a sentence expresses a customer requirement and, if yes, which demand IDs apply. "
+        "Return STRICT JSON only."
+    )
+
+    # Provide demand catalog in a compact way (IDs + short meaning)
+    # For many demands, you may want to truncate descriptions.
+    catalog_lines = []
+    for d in DEMANDS:
+        # keep it short; long catalog can blow context
+        desc = d["description"]
+        if len(desc) > 200:
+            desc = desc[:200] + "…"
+        catalog_lines.append(f'- {d["id"]}: {d["demand"]} | {desc}')
+    catalog = "\n".join(catalog_lines)
+
+    user = f"""
+TEXT:
+{t}
+
+DEMAND CATALOG (id: demand | description):
+{catalog}
+
+TASK:
+1) Estimate relevance_proba (0..1): probability TEXT contains a customer requirement that should be labeled.
+2) If relevance_proba < 0.5 => return empty predictions.
+3) Else return up to {top_k} predictions (most likely first).
+Each prediction must contain:
+- id: demand id (string; must be one of catalog ids)
+- probability: 0..1
+
+RETURN JSON ONLY in this schema:
+{{
+  "relevance_proba": 0.0,
+  "predictions": [{{"id":"<demand_id>", "probability":0.0}}]
+}}
+""".strip()
+
+    resp = client.chat.completions.create(
+        model=CHAT_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        # Do NOT force temperature=0 because you already saw model rejecting it.
+        # If you want determinism, leave default or use 1.0 (if model only supports 1).
+    )
+
+    content = resp.choices[0].message.content or ""
+    # Strict JSON parse with fallback
+    try:
+        data = json.loads(content)
+    except Exception:
+        logger.warning("Model returned non-JSON. Falling back to no predictions.")
+        return 0.0, []
+
+    rel = float(data.get("relevance_proba", 0.0) or 0.0)
+    raw_preds = data.get("predictions", []) or []
+
+    preds: List[Dict[str, Any]] = []
+    allowed_ids = {d["id"] for d in DEMANDS}
+
+    for p in raw_preds[:top_k]:
+        did = str(p.get("id", "")).strip()
+        prob = p.get("probability", None)
+        try:
+            prob = float(prob)
+        except Exception:
+            prob = None
+        if did and did in allowed_ids and prob is not None:
+            # IMPORTANT: keep same shape as old transformer predictions: {label, proba}
+            preds.append({"label": did, "proba": max(0.0, min(1.0, prob))})
+
+    # If relevance low, force empty
+    if rel < 0.5:
+        return rel, []
+
+    return max(0.0, min(1.0, rel)), preds
+
+def _inference(document: Dict[str, Any], num_preds: int) -> Dict[str, Any]:
+    start = time.time()
+
+    items = _safe_get_content_items(document)
+    logger.info(f"Content items: {len(items)} | num_preds={num_preds}")
+
+    document_demand_ids = set()
+
+    for content in items:
+        text = content.get("text", "")
+        rel, preds = _llm_predict_for_text(text, top_k=num_preds)
+
+        # Keep keys compatible with previous pipeline:
+        content["relevantProba"] = rel
+
+        # Old code had logreg + transformer outputs.
+        # To avoid breaking downstream, keep both:
+        content["cdLogregPredictions"] = []  # we don't have it; keep empty list
+        content["cdTransformerPredictions"] = preds
+
+        if preds:
+            # Old behavior: add top prediction label to document-level set
+            document_demand_ids.add(preds[0]["label"])
+
+    # App expects this field in response (either top-level or under predictions):
+    # Most compatible: list of strings (demand ids)
+    document["documentDemandPredictions"] = sorted(document_demand_ids)
+
+    logger.info(f"Inference done in {time.time() - start:.2f}s. doc demands: {len(document_demand_ids)}")
+    return document
+
+# -----------------------------
+# Azure ML entrypoints
+# -----------------------------
+
+def init():
+    global client, CHAT_DEPLOYMENT, DEMANDS
+
+    # IMPORTANT: these env vars must be in the ONLINE DEPLOYMENT environment_variables
+    endpoint = _get_env("AZURE_OPENAI_ENDPOINT")
+    api_key = _get_env("AZURE_OPENAI_API_KEY")
+    api_version = _get_env("AZURE_OPENAI_API_VERSION")
+
+    # Your chat deployment name in Azure OpenAI (NOT model name like "gpt-5-mini")
+    CHAT_DEPLOYMENT = _get_env("AZURE_OPENAI_CHAT_DEPLOYMENT")
+
+    client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+    )
+
+    DEMANDS = _load_demands_xlsx()
+    logger.info("init() completed successfully.")
+
+def run(raw_data):
+    """
+    Expects JSON string:
+    {"document": {...}, "model": "...", "num_preds": 3}
+    Returns:
+    {"predictions": <document-with-updates>}
+    """
+    try:
+        if raw_data is None or (isinstance(raw_data, str) and raw_data.strip() == ""):
+            return {"error": "Empty request body"}
+
+        req = raw_data
+        if isinstance(raw_data, (bytes, bytearray)):
+            req = raw_data.decode("utf-8", errors="replace")
+
+        if isinstance(req, str):
+            request_data = json.loads(req)
+        elif isinstance(req, dict):
+            request_data = req
+        else:
+            return {"error": f"Unsupported request type: {type(raw_data)}"}
+
+        if "document" not in request_data:
+            return {"error": "Missing 'document' in request body"}
+        if "num_preds" not in request_data:
+            return {"error": "Missing 'num_preds' in request body"}
+
+        document = request_data["document"]
+        num_preds = int(request_data["num_preds"])
+
+        # document can be already dict; if it's a JSON string, parse it
+        if isinstance(document, str):
+            document = json.loads(document)
+
+        out_doc = _inference(document, num_preds)
+
+        # IMPORTANT: app checks json["predictions"]["documentDemandPredictions"] first.
+        return {"predictions": out_doc}
+
+    except Exception as e:
+        logger.exception("Unhandled error in run()")
+        # Return structured error so you can see it in app logs (if they bubble response body)
+        return {"error": str(e)}
