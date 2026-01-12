@@ -1,262 +1,244 @@
 import os
 import json
-import logging
 import time
-from typing import Any, Dict, List, Optional
+import math
+import logging
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 from openai import AzureOpenAI
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("demand-labeler")
 
-# --- Globals initialized in init() ---
-client: Optional[AzureOpenAI] = None
+# Globals initialized in init()
+CLIENT: AzureOpenAI = None
+EMBED_DEPLOYMENT: str = None
 DEMANDS: List[Dict[str, str]] = []
-DEMAND_EMB: Optional[np.ndarray] = None
+DEMAND_EMB: np.ndarray = None  # shape (N, D)
 
-# --- Env config ---
-AZURE_CHAT_DEPLOYMENT = (os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or "").strip()
-AZURE_EMBED_DEPLOYMENT = (os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT") or "").strip()
-AZURE_OPENAI_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip()
-AZURE_OPENAI_API_KEY = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
-AZURE_OPENAI_API_VERSION = (os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview").strip()
-
-TOP_K_RAG = int(os.getenv("TOP_K_RAG", "8"))
-MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))
-MIN_KEEP_PROBA = float(os.getenv("MIN_KEEP_PROBA", "0.30"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "4000"))
-
-
-def _l2_normalize(x: np.ndarray) -> np.ndarray:
-    denom = (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
-    return x / denom
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
+# -----------------------------
+# Utilities
+# -----------------------------
+def _safe_float(x, default=0.0) -> float:
     try:
-        return float(v)
+        return float(x)
     except Exception:
-        return default
+        return float(default)
 
+def _cosine_sim_matrix(query_vec: np.ndarray, mat: np.ndarray) -> np.ndarray:
+    # query_vec shape (D,), mat shape (N,D)
+    q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+    m = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
+    return m @ q  # (N,)
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def init():
+def _sim_to_proba(sim: float) -> float:
     """
-    Called once per container start by Azure ML.
-    Loads demands from Excel and embeds them for retrieval.
+    Convert cosine similarity [-1..1] to a pseudo-probability [0..1].
+    Tunable. This is deterministic and monotonic.
     """
-    global client, DEMANDS, DEMAND_EMB
+    # shift to [0..1]
+    s = (sim + 1.0) / 2.0
+    # sharpen a bit (optional)
+    s = s ** 2
+    return max(0.0, min(1.0, float(s)))
 
-    logger.info("INIT: starting...")
+def _pick_content_store(document: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (store_name, byId_dict) from either:
+      - document["contentDomain"]["byId"]
+      - document["content"]["byId"]
+    """
+    for store_name in ("contentDomain", "content"):
+        node = document.get(store_name)
+        if isinstance(node, dict) and isinstance(node.get("byId"), dict):
+            return store_name, node["byId"]
+    raise ValueError("Cannot find content store. Expected document.contentDomain.byId or document.content.byId")
 
-    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY:
-        raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY env vars.")
+def _get_embedding(texts: List[str]) -> List[List[float]]:
+    # Embeddings API in Azure OpenAI python SDK
+    # Keep it simple: one request for many inputs (works for most deployments).
+    resp = CLIENT.embeddings.create(model=EMBED_DEPLOYMENT, input=texts)
+    # Ensure order preserved
+    return [d.embedding for d in resp.data]
 
-    if not AZURE_CHAT_DEPLOYMENT or not AZURE_EMBED_DEPLOYMENT:
-        raise RuntimeError("Missing AZURE_OPENAI_CHAT_DEPLOYMENT or AZURE_OPENAI_EMBED_DEPLOYMENT env vars.")
+def _load_demands_xlsx(path: str) -> List[Dict[str, str]]:
+    df = pd.read_excel(path)
+    expected = {"demand_id", "demand", "description"}
+    cols = set([c.strip() for c in df.columns])
+    missing = expected - cols
+    if missing:
+        raise ValueError(f"demands.xlsx missing columns: {sorted(list(missing))}. Found: {sorted(list(cols))}")
 
-    client = AzureOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-    )
+    # normalize column names if needed
+    df = df.rename(columns={c: c.strip() for c in df.columns})
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    demands_path = os.path.join(base_dir, "demands.xlsx")
-    if not os.path.exists(demands_path):
-        raise FileNotFoundError(f"demands.xlsx not found at: {demands_path}")
-
-    df = pd.read_excel(demands_path)
-
-    required_cols = {"demand_id", "demand", "description"}
-    if not required_cols.issubset(df.columns):
-        raise RuntimeError(f"demands.xlsx missing columns. Required: {required_cols}, got: {set(df.columns)}")
-
-    DEMANDS = []
-    embed_inputs: List[str] = []
-
+    demands = []
     for _, row in df.iterrows():
         did = str(row["demand_id"]).strip()
-        name = str(row["demand"]).strip()
-        desc = str(row["description"]).strip()
-
+        dname = str(row["demand"]).strip()
+        ddesc = str(row["description"]).strip() if not pd.isna(row["description"]) else ""
         if not did or did.lower() == "nan":
             continue
-        if not name or name.lower() == "nan":
-            continue
+        demands.append({"id": did, "demand": dname, "description": ddesc})
+    if not demands:
+        raise ValueError("demands.xlsx loaded but resulted in 0 demands (check demand_id values).")
+    return demands
 
-        DEMANDS.append({"id": did, "name": name, "description": desc})
-        embed_inputs.append(f"Name: {name}\nClarification: {desc}")
+def _build_demand_text(d: Dict[str, str]) -> str:
+    # what we embed for each label
+    # include both demand name and description
+    demand = d.get("demand", "").strip()
+    desc = d.get("description", "").strip()
+    if desc:
+        return f"{demand}\n{desc}"
+    return demand
 
-    if not DEMANDS:
-        raise RuntimeError("No demands loaded from Excel (DEMANDS is empty).")
-
-    t0 = time.time()
-    emb = client.embeddings.create(
-        model=AZURE_EMBED_DEPLOYMENT,
-        input=embed_inputs
-    )
-    DEMAND_EMB = _l2_normalize(np.array([e.embedding for e in emb.data], dtype=np.float32))
-    logger.info(f"INIT: loaded {len(DEMANDS)} demands. Embedding time: {time.time() - t0:.2f}s")
-
-
-def _retrieve_candidates(chunk_text: str, k: int) -> List[Dict[str, str]]:
-    if client is None or DEMAND_EMB is None or not DEMANDS:
+def _predict_for_text(text: str, top_k: int = 3, min_proba: float = 0.55) -> List[Dict[str, Any]]:
+    """
+    Returns list like [{"label": demand_id, "proba": 0.87}, ...]
+    """
+    text = (text or "").strip()
+    if len(text) < 3:
         return []
 
-    emb = client.embeddings.create(
-        model=AZURE_EMBED_DEPLOYMENT,
-        input=[chunk_text]
-    )
-    q = _l2_normalize(np.array([emb.data[0].embedding], dtype=np.float32))
-    sims = DEMAND_EMB @ q[0]
-    idx = np.argsort(-sims)[:k]
-    return [DEMANDS[i] for i in idx]
+    q_emb = np.array(_get_embedding([text])[0], dtype=np.float32)
+    sims = _cosine_sim_matrix(q_emb, DEMAND_EMB)
+    idx = np.argsort(-sims)[: max(1, int(top_k))]
 
+    preds = []
+    for i in idx:
+        proba = _sim_to_proba(float(sims[i]))
+        if proba >= float(min_proba):
+            preds.append({"label": DEMANDS[int(i)]["id"], "proba": float(round(proba, 4))})
 
-def _llm_classify_chunk(chunk_id: str, chunk_text: str, candidates: List[Dict[str, str]]) -> Dict[str, Any]:
-    if client is None:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "AzureOpenAI client not initialized."}
-
-    if not candidates:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "No candidates from retrieval."}
-
-    demands_context = "\n".join(
-        [f"- id: {d['id']}\n  name: {d['name']}\n  clarification: {d['description']}" for d in candidates]
-    )
-
-    system = (
-        "You label customer requirements in product documentation.\n"
-        "You MUST only choose from the provided demands.\n"
-        "Match ONLY when the chunk clearly satisfies the demand's clarification.\n"
-        "Return at most 3 demands.\n"
-        "If nothing matches, return an empty demandIds array.\n"
-        "Probabilities must be in [0.0, 1.0].\n"
-        "Return JSON only."
-    )
-
-    user = f"""
-Demands (id, name, clarification):
-{demands_context}
-
-ChunkId: {chunk_id}
-Chunk text:
-{chunk_text}
-
-Return JSON in this format exactly:
-{{
-  "chunkId": "{chunk_id}",
-  "demandIds": [{{"id":"<one of provided ids>","probability":0.85}}],
-  "explanation": "brief reason"
-}}
-""".strip()
-
-    # IMPORTANT: część wdrożeń Azure odrzuca temperature=0; nie ustawiamy temperature.
-    resp = client.chat.completions.create(
-        model=AZURE_CHAT_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-
-    content = resp.choices[0].message.content or ""
-    parsed = _safe_json_loads(content)
-    if not parsed:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "LLM returned non-JSON."}
-    return parsed
-
-
-def _pad_predictions(preds: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    """
-    Ensures list has exactly n items.
-    Pads with empty predictions so downstream code that indexes [0] won't crash.
-    """
-    preds = preds[:n]
-    while len(preds) < n:
-        preds.append({"label": "", "proba": 0.0})
+    # sort by proba desc
+    preds.sort(key=lambda x: x["proba"], reverse=True)
     return preds
 
+# -----------------------------
+# Azure ML entrypoints
+# -----------------------------
+def init():
+    global CLIENT, EMBED_DEPLOYMENT, DEMANDS, DEMAND_EMB
 
-def run(raw_data: Any) -> Dict[str, Any]:
+    logger.info("Initializing demand labeler...")
+
+    # Azure OpenAI env
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
+    EMBED_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT", "").strip()
+
+    if not azure_endpoint or not api_key or not api_version or not EMBED_DEPLOYMENT:
+        raise RuntimeError(
+            "Missing env vars. Required: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+            "AZURE_OPENAI_API_VERSION, AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT"
+        )
+
+    CLIENT = AzureOpenAI(
+        azure_endpoint=azure_endpoint,
+        api_key=api_key,
+        api_version=api_version,
+    )
+
+    # Locate demands.xlsx
+    # In AML, you typically bundle it in the code folder. Keep it next to score.py.
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    demands_path = os.environ.get("DEMANDS_XLSX_PATH", os.path.join(base_dir, "demands.xlsx"))
+
+    DEMANDS = _load_demands_xlsx(demands_path)
+    logger.info("Loaded %d demands from %s", len(DEMANDS), demands_path)
+
+    # Precompute embeddings for all demands (fast inference later)
+    demand_texts = [_build_demand_text(d) for d in DEMANDS]
+    emb = _get_embedding(demand_texts)
+    DEMAND_EMB = np.array(emb, dtype=np.float32)
+
+    logger.info("Initialized successfully. Demand embedding matrix shape=%s", DEMAND_EMB.shape)
+
+
+def run(raw_data):
     """
-    Azure ML Online Endpoint entrypoint.
-
-    Expects:
-      { "document": <doc>, "num_preds": 3 }
-
-    Returns:
-      <doc>  (NOT wrapped), with:
-        - per chunk: relevantProba, cdLogregPredictions, cdTransformerPredictions
-        - doc: documentDemandPredictions
+    Expects raw_data to be JSON string or dict. We handle both.
+    Must return a JSON-serializable object.
     """
-    request = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-    if not isinstance(request, dict):
-        raise ValueError("Request must be a JSON object/dict.")
+    start = time.time()
 
-    if "document" not in request or "num_preds" not in request:
-        raise ValueError("Invalid input: expected 'document' and 'num_preds'.")
+    try:
+        if raw_data is None:
+            return {"error": "Empty request body (raw_data is None)"}
 
-    document = request["document"]
-    num_pred = int(request["num_preds"])
+        if isinstance(raw_data, (bytes, bytearray)):
+            raw_data = raw_data.decode("utf-8", errors="replace")
 
-    by_id = document.get("contentDomain", {}).get("byId", {})
-    if not isinstance(by_id, dict):
-        raise ValueError("document.contentDomain.byId must be an object/dict.")
-
-    document_demand_predictions = set()
-
-    for chunk_id, content in by_id.items():
-        text = str(content.get("text", "") or "")[:MAX_TEXT_CHARS]
-
-        # Default safe outputs (never crash app)
-        relevant_proba = 0.0
-        cd_transformer_preds: List[Dict[str, Any]] = []
-        cd_logreg_preds: List[Dict[str, Any]] = []
-
-        if client is not None and DEMAND_EMB is not None and DEMANDS:
-            candidates = _retrieve_candidates(text, TOP_K_RAG)
-            llm_out = _llm_classify_chunk(chunk_id, text, candidates)
-
-            tmp = []
-            for item in (llm_out.get("demandIds", []) or [])[:MAX_LABELS_PER_CHUNK]:
-                did = str(item.get("id", "")).strip()
-                proba = _safe_float(item.get("probability", 0.0))
-                if did and proba >= MIN_KEEP_PROBA:
-                    tmp.append({"label": did, "proba": proba})
-                    document_demand_predictions.add(did)
-
-            tmp = sorted(tmp, key=lambda x: x["proba"], reverse=True)
-            relevant_proba = tmp[0]["proba"] if tmp else 0.0
-
-            # IMPORTANT: keep schema stable and non-empty lists if app indexes [0]
-            cd_transformer_preds = _pad_predictions(tmp, num_pred)
-
-            # We no longer have logreg; we provide a compatible placeholder list
-            # so downstream indexing won't crash.
-            cd_logreg_preds = _pad_predictions(tmp, num_pred)
-
+        if isinstance(raw_data, str):
+            raw_data = raw_data.strip()
+            if not raw_data:
+                return {"error": "Empty request body (raw_data is empty string)"}
+            try:
+                request_data = json.loads(raw_data)
+            except json.JSONDecodeError as e:
+                return {"error": "Invalid JSON", "detail": str(e)}
+        elif isinstance(raw_data, dict):
+            request_data = raw_data
         else:
-            cd_transformer_preds = _pad_predictions([], num_pred)
-            cd_logreg_preds = _pad_predictions([], num_pred)
+            return {"error": f"Unsupported request type: {type(raw_data)}"}
 
-        content.update({
-            "relevantProba": float(relevant_proba),
-            "cdLogregPredictions": cd_logreg_preds,
-            "cdTransformerPredictions": cd_transformer_preds,
-        })
+        # IMPORTANT: your old score.py likely expected {"document": <dict>, "num_preds": <int>}
+        # but sometimes AML/app sends the document directly. Support both.
+        if "document" in request_data:
+            document = request_data["document"]
+        else:
+            document = request_data
 
-    document["documentDemandPredictions"] = list(document_demand_predictions)
+        num_pred = int(request_data.get("num_preds", request_data.get("numPreds", 3)) or 3)
 
-    # CRITICAL: return document directly (old behavior)
-    return document
+        if not isinstance(document, dict):
+            return {"error": "Invalid 'document' type", "detail": f"Expected dict, got {type(document)}"}
+
+        store_name, by_id = _pick_content_store(document)
+        logger.info("Using store=%s with %d items", store_name, len(by_id))
+
+        # Per-content predictions
+        doc_demand_ids = set()
+
+        # NOTE: iterate in stable order (dict order in Python is insertion order)
+        for _, content in by_id.items():
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if not isinstance(text, str) or not text.strip():
+                # still ensure keys exist to avoid frontend assumptions
+                content.setdefault("cdTransformerPredictions", [])
+                continue
+
+            preds = _predict_for_text(text, top_k=num_pred, min_proba=0.55)
+
+            # This is the key contract: label MUST be demand_id
+            content["cdTransformerPredictions"] = preds
+
+            # Optional: if your UI expects these keys to exist (safe defaults)
+            content.setdefault("relevantProba", 1.0 if preds else 0.0)
+            content.setdefault("cdLogregPredictions", [])
+
+            for p in preds:
+                doc_demand_ids.add(p["label"])
+
+        # Document-level field (old code used a set -> list)
+        document["documentDemandPredictions"] = sorted(list(doc_demand_ids))
+
+        latency = round(time.time() - start, 3)
+        logger.info("Completed scoring in %ss, doc_demands=%d", latency, len(doc_demand_ids))
+
+        # IMPORTANT: wrapper. Your old score.py returned {"predictions": document}
+        # Keep that to avoid breaking the app.
+        return {"predictions": document}
+
+    except Exception as e:
+        # Don’t crash container; return explicit error + log stacktrace.
+        logger.exception("Unhandled error in run()")
+        return {"error": "Internal server error", "detail": str(e)}
 
 
