@@ -1,32 +1,483 @@
-import json
 import os
+import json
+import time
+import logging
+from typing import Dict, Any, List, Tuple, Optional
 
-os.environ["USE_MOCK"] = "1"  # test kontraktu bez OpenAI
+import pandas as pd
 
-import score  # score.py
+# Azure OpenAI (OpenAI SDK v1)
+from openai import AzureOpenAI
 
-def main():
-    score.init()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    payload = {
-        "document": {
-            "contentDomain": {
-                "byId": {
-                    "c1": {"id": "c1", "text": "Supplier shall provide ISO 9001 and ISO 14001 certificates."},
-                    "c2": {"id": "c2", "text": "Warranty period shall be at least 24 months from delivery."},
-                    "c3": {"id": "c3", "text": "Installation shall be performed according to the installation manual."},
-                    "c4": {"id": "c4", "text": "Table of contents."},
-                    "c5": {"id": "c5", "text": "Ingress protection class IP55 is required."},
-                    "c6": {"id": "c6", "text": "Delivery shall be DDP including customs clearance."},
-                }
-            }
-        },
-        "model": "WheShe",
-        "num_preds": 3
-    }
+# Globals initialized in init()
+aoai_client: Optional[AzureOpenAI] = None
+aoai_deployment: Optional[str] = None
 
-    out = score.run(json.dumps(payload))
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+demands: List[Dict[str, str]] = []  # list of {"id":..., "name":..., "description":...}
 
-if __name__ == "__main__":
-    main()
+
+# -----------------------------
+# Helpers: demands loading
+# -----------------------------
+def _this_dir() -> str:
+    # Folder where score.py lives (works both locally and in AML image)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_demands_file() -> str:
+    """
+    Demands must be in the same folder as score.py/.env, per your requirement.
+    Supported file names (first match wins):
+      - demands.xlsx
+      - demands.csv
+      - demands.json
+    """
+    base = _this_dir()
+    candidates = [
+        os.path.join(base, "demands.xlsx"),
+        os.path.join(base, "demands.csv"),
+        os.path.join(base, "demands.json"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        f"Demands file not found next to score.py. Expected one of: {', '.join(os.path.basename(x) for x in candidates)}"
+    )
+
+
+def _normalize_demands_from_df(df: pd.DataFrame) -> List[Dict[str, str]]:
+    """
+    Your Excel has columns:
+      - demand_id
+      - demand
+      - demand_description
+
+    We normalize to:
+      - id (demand_id)
+      - name (demand)
+      - description (demand_description)
+    """
+    required = {"demand_id", "demand", "demand_description"}
+    cols = set([c.strip() for c in df.columns])
+    missing = required - cols
+    if missing:
+        raise ValueError(f"Demands file missing required columns: {sorted(missing)}. Found: {sorted(cols)}")
+
+    out: List[Dict[str, str]] = []
+    for _, row in df.iterrows():
+        did = str(row["demand_id"]).strip()
+        name = str(row["demand"]).strip()
+        desc = str(row["demand_description"]).strip()
+        if not did:
+            continue
+        out.append({"id": did, "name": name, "description": desc})
+    return out
+
+
+def _load_demands() -> List[Dict[str, str]]:
+    path = _find_demands_file()
+    logger.info(f"Loading demands from: {path}")
+
+    if path.endswith(".xlsx"):
+        df = pd.read_excel(path)
+        return _normalize_demands_from_df(df)
+
+    if path.endswith(".csv"):
+        df = pd.read_csv(path)
+        return _normalize_demands_from_df(df)
+
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # We accept only the shape YOU need (list or {"demands":[...]})
+        if isinstance(data, dict) and "demands" in data:
+            data = data["demands"]
+        if not isinstance(data, list):
+            raise ValueError("demands.json must be a list or {\"demands\":[...]}")
+
+        # Map common keys to your contract
+        out: List[Dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("demand_id") or item.get("id") or "").strip()
+            name = str(item.get("demand") or item.get("name") or "").strip()
+            desc = str(item.get("demand_description") or item.get("description") or item.get("clarification") or "").strip()
+            if not did:
+                continue
+            out.append({"id": did, "name": name, "description": desc})
+        return out
+
+    raise ValueError(f"Unsupported demands file type: {path}")
+
+
+# -----------------------------
+# Helpers: prompt + AOAI
+# -----------------------------
+def _build_demands_context(demands_list: List[Dict[str, str]]) -> str:
+    # Match your prompt semantics: Name + Clarification (we feed description here)
+    lines = []
+    for d in demands_list:
+        lines.append(f"- ID: {d['id']}\n  Name: {d['name']}\n  Clarification: {d['description']}")
+    return "\n".join(lines)
+
+
+def _build_chunks_text(chunks: List[Tuple[str, str]]) -> str:
+    # chunks = [(chunkId, text), ...]
+    # Keep it explicit and deterministic for the model.
+    out = []
+    for cid, txt in chunks:
+        txt = (txt or "").replace("\n", " ").strip()
+        out.append(f'ChunkId: "{cid}"\nText: "{txt}"\n')
+    return "\n".join(out)
+
+
+def _prompt_template(demands_context: str, chunks_text: str) -> str:
+    # Based on your screenshots: rules, scoring, demands context, chunks, response schema.
+    return f"""
+You support bid engineers working in Alfa Laval in finding specific information in bid documentation received from the customer.
+Bid documentation is related to alfa laval fresh water systems requirements, for equipment installation or service.
+
+**Your Task:**
+Assign relevant demands to each text chunk (paragraph) given below.
+Use the demand description available in demands to understand the meaning of demands.
+
+For each chunk, follow this process:
+1. Read the chunk content carefully
+2. Review the demand descriptions (Name and Clarification)
+3. Determine which demands apply based on the demand's clarification field
+4. Assign matching demands with confidence scores (probability)
+
+**Rules & Constraints:**
+- The demand **Name** tells you WHAT equipment this applies to
+- The **Clarification** tells you WHEN to match (specific requirement criteria)
+- Match ONLY when the chunk content aligns with the demand's **Clarification** field
+- You MUST use only the predefined demands from the list provided
+- Find maximum three demands per chunk
+- If no relevant demands found, return empty demandIds array
+
+**Scoring Guidelines:**
+For each demand that has traces in the text, provide a probability score (0.0 to 1.0) indicating relevance:
+- 1.0: Direct, explicit mention matching the exact demand requirement
+- 0.7-0.9: Strong semantic relationship, specification clearly applies to the demand
+- 0.5-0.7: Moderate relationship, likely relevant specification
+- 0.3-0.5: Weak relationship, potentially applicable
+- Below 0.3: Not relevant (exclude from results)
+
+**Understanding demands:**
+Each demand has:
+- **Name**: Identifies the equipment category and requirement type
+- **Clarification**: Describes when to use this demand
+
+**Demands:**
+{demands_context}
+
+**Text Chunks to analyze:**
+{chunks_text}
+
+Respond with valid JSON in this format:
+{{
+  "results": [
+    {{
+      "chunkId": "chunk_id",
+      "demandIds": [{{"id": "demand_id", "probability": 0.85}}],
+      "explanation": "Brief explanation"
+    }}
+  ]
+}}
+""".strip()
+
+
+def _call_aoai(prompt: str) -> Dict[str, Any]:
+    assert aoai_client is not None and aoai_deployment is not None
+
+    # We require strict JSON. If model returns extra text, we’ll attempt to extract JSON robustly.
+    resp = aoai_client.chat.completions.create(
+        model=aoai_deployment,
+        messages=[
+            {"role": "system", "content": "You are a careful information extraction assistant. Output only valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=2000,
+    )
+
+    content = resp.choices[0].message.content or ""
+    content = content.strip()
+
+    # Robust JSON parse (handles accidental leading/trailing text)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Try to extract first JSON object
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(content[start : end + 1])
+        raise
+
+
+# -----------------------------
+# Legacy-style gating (same semantics as your old code)
+# -----------------------------
+def is_relevant_customer_demand(
+    text: str,
+    relevant_proba: float,
+    cd_logreg_proba: float,
+    cd_transformer_proba: float,
+) -> bool:
+    # From your screenshot logic:
+    # return (
+    #   len(text.split(" ")) > 2
+    #   and cd_logreg_proba > 0.1
+    #   and ((relevant_proba > 0.65 and cd_transformer_proba > 0.9) or cd_transformer_proba > 0.95)
+    # )
+    return (
+        len((text or "").split(" ")) > 2
+        and cd_logreg_proba > 0.1
+        and ((relevant_proba > 0.65 and cd_transformer_proba > 0.9) or (cd_transformer_proba > 0.95))
+    )
+
+
+# -----------------------------
+# Azure ML entrypoints
+# -----------------------------
+def init():
+    global aoai_client, aoai_deployment, demands
+
+    logger.info("Initializing model...")
+
+    # Load demands (local folder next to score.py)
+    demands = _load_demands()
+    if not demands:
+        raise RuntimeError("Demands list is empty after loading demands file.")
+    logger.info(f"Loaded demands: {len(demands)}")
+
+    # Azure OpenAI config
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+    aoai_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+
+    missing = [k for k, v in {
+        "AZURE_OPENAI_ENDPOINT": endpoint,
+        "AZURE_OPENAI_API_KEY": api_key,
+        "AZURE_OPENAI_API_VERSION": api_version,
+        "AZURE_OPENAI_DEPLOYMENT": aoai_deployment,
+    }.items() if not v]
+
+    if missing:
+        raise RuntimeError(f"Missing required env vars for Azure OpenAI: {missing}")
+
+    aoai_client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+    )
+
+    logger.info("Initialization completed.")
+
+
+def inference(document: Dict[str, Any], num_cd_predictions: int):
+    """
+    1:1 behavior with legacy:
+      - Iterate contentDomain.byId values
+      - Add relevantProba, cdLogregPredictions, cdTransformerPredictions
+      - Add documentDemandPredictions (global unique set of labels)
+      - Return mutated document
+    """
+    start_time = time.time()
+
+    # Validate shape
+    if not isinstance(document, dict):
+        raise ValueError("document must be a JSON object")
+
+    content_domain = document.get("contentDomain", {})
+    by_id = content_domain.get("byId", {})
+
+    if not isinstance(by_id, dict):
+        raise ValueError("document.contentDomain.byId must be an object (map of id -> content)")
+
+    # Prepare ordered chunks (stable iteration)
+    contents: List[Dict[str, Any]] = list(by_id.values())
+    chunks: List[Tuple[str, str]] = []
+    for c in contents:
+        cid = str(c.get("id", "")).strip()
+        txt = str(c.get("text", "") or "")
+        if cid:
+            chunks.append((cid, txt))
+        else:
+            # Still keep placeholder: if no id, skip (UI relies on id)
+            pass
+
+    # If nothing to score, preserve contract
+    if not chunks:
+        document["documentDemandPredictions"] = []
+        return document
+
+    # Build prompt once for the whole document (can be batched if needed)
+    demands_context = _build_demands_context(demands)
+
+    # Basic batching to avoid oversized prompts
+    max_chunks_per_call = int(os.getenv("MAX_CHUNKS_PER_CALL", "25"))
+    document_demand_predictions = set()
+
+    # For relevance/logreg/transformer emulation:
+    # - We use transformer predictions = raw LLM probabilities (filtered >=0.3, top N)
+    # - logreg predictions = slightly downscaled to keep old gating semantics stable
+    # - relevantProba = max transformer proba (or 0.0)
+    for i in range(0, len(chunks), max_chunks_per_call):
+        batch = chunks[i : i + max_chunks_per_call]
+        chunks_text = _build_chunks_text(batch)
+        prompt = _prompt_template(demands_context, chunks_text)
+
+        llm_json = _call_aoai(prompt)
+        results = llm_json.get("results", [])
+        if not isinstance(results, list):
+            raise ValueError("LLM response JSON missing 'results' array")
+
+        # Index results by chunkId
+        res_by_chunk: Dict[str, Dict[str, Any]] = {}
+        for r in results:
+            if isinstance(r, dict) and "chunkId" in r:
+                res_by_chunk[str(r["chunkId"])] = r
+
+        # Apply back to document
+        # We must update the correct content objects in byId: easiest via mapping id->content
+        content_by_id: Dict[str, Dict[str, Any]] = {}
+        for key, val in by_id.items():
+            if isinstance(val, dict) and "id" in val:
+                content_by_id[str(val["id"])] = val
+
+        for cid, txt in batch:
+            content_obj = content_by_id.get(cid)
+            if content_obj is None:
+                continue
+
+            r = res_by_chunk.get(cid, {})
+            demand_ids = r.get("demandIds", [])
+            if not isinstance(demand_ids, list):
+                demand_ids = []
+
+            # Keep only valid demands and normalize
+            normalized: List[Dict[str, Any]] = []
+            for di in demand_ids:
+                if not isinstance(di, dict):
+                    continue
+                did = str(di.get("id", "")).strip()
+                try:
+                    prob = float(di.get("probability", 0.0))
+                except Exception:
+                    prob = 0.0
+                if not did:
+                    continue
+                if prob < 0.3:
+                    continue
+                normalized.append({"label": did, "proba": max(0.0, min(1.0, prob))})
+
+            # Sort by proba desc and limit to num_cd_predictions
+            normalized.sort(key=lambda x: x["proba"], reverse=True)
+            top = normalized[: max(1, int(num_cd_predictions))]
+
+            # Emulate legacy fields
+            cd_transformer_predictions = top
+
+            # Downscale logreg slightly (still same label/proba shape)
+            cd_logreg_predictions = [
+                {"label": p["label"], "proba": max(0.0, min(1.0, p["proba"] * 0.85))}
+                for p in top
+            ]
+
+            relevant_proba = top[0]["proba"] if top else 0.0
+
+            # Attach to content (1:1 field names)
+            content_obj["relevantProba"] = float(relevant_proba)
+            content_obj["cdLogregPredictions"] = cd_logreg_predictions
+            content_obj["cdTransformerPredictions"] = cd_transformer_predictions
+
+            # Legacy gating for documentDemandPredictions uses top-1
+            if top:
+                cd_logreg_top = float(cd_logreg_predictions[0]["proba"]) if cd_logreg_predictions else 0.0
+                cd_tr_top = float(cd_transformer_predictions[0]["proba"]) if cd_transformer_predictions else 0.0
+
+                if is_relevant_customer_demand(
+                    text=str(txt),
+                    relevant_proba=float(relevant_proba),
+                    cd_logreg_proba=cd_logreg_top,
+                    cd_transformer_proba=cd_tr_top,
+                ):
+                    # Legacy uses transformer top label
+                    document_demand_predictions.add(cd_transformer_predictions[0]["label"])
+
+    # Update global field (legacy name)
+    document["documentDemandPredictions"] = list(document_demand_predictions)
+
+    latency = time.time() - start_time
+    logger.info(f"Time to score + format results: {latency:.3f}s")
+
+    return document
+
+
+def run(raw_data):
+    """
+    Must remain 1:1 with old score.py:
+      - parse JSON
+      - require 'document' and 'num_preds'
+      - call inference(document, num_pred)
+      - return {"predictions": response} when response is dict
+    """
+    try:
+        logger.info(f"Received request with data: {str(raw_data)[:2000]}")
+
+        if raw_data is None:
+            raise ValueError("Bad Request: Request body cannot be empty!")
+
+        if isinstance(raw_data, (bytes, bytearray)):
+            raw_data = raw_data.decode("utf-8", errors="ignore")
+
+        if isinstance(raw_data, str):
+            if raw_data.strip() == "":
+                raise ValueError("Bad Request: Request body cannot be empty!")
+            try:
+                request_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                raise ValueError("Bad Request: Invalid JSON format!")
+        elif isinstance(raw_data, dict):
+            request_data = raw_data
+        else:
+            # AML sometimes passes already-parsed JSON; accept dict only
+            raise ValueError("Bad Request: Unsupported request body type!")
+
+        if "document" not in request_data or "num_preds" not in request_data:
+            raise ValueError("Bad Request: Invalid input, expected 'document' and 'num_preds' to be in request body!")
+
+        document = request_data["document"]
+        num_pred = int(request_data["num_preds"])
+
+        # If document came as stringified JSON, parse it
+        if isinstance(document, str):
+            document = json.loads(document)
+
+        response = inference(document, num_pred)
+
+        logger.info(f"Inference response keys: {list(response.keys())[:50]}")
+
+        if isinstance(response, dict):
+            return {"predictions": response}
+        elif hasattr(response, "tolist"):
+            return {"predictions": response.tolist()}
+        else:
+            return {"error": "Unexpected response format!"}
+
+    except ValueError as ve:
+        logger.warning(f"Bad request: {str(ve)}")
+        raise
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}", exc_info=True)
+        raise Exception("Internal server error")
+
