@@ -1,81 +1,37 @@
-$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
-name: llm
-endpoint_name: YOUR_EXISTING_ENDPOINT_NAME
+from azure.core.exceptions import HttpResponseError
 
-model: null
+poller = ml_client.online_deployments.begin_create_or_update(deployment)
 
-code_configuration:
-  code: .
-  scoring_script: score.py
+try:
+    result = poller.result()
+    print("DEPLOYMENT OK:", result.name, result.provisioning_state)
+except HttpResponseError as e:
+    print("\n=== HttpResponseError ===")
+    print("Status:", getattr(e, "status_code", None))
+    print("Message:", str(e))
 
-environment: azureml:openai-rag-demand-labeler-env@latest
+    # często Azure ma więcej w e.response / e.error
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            print("\n--- response text ---")
+            print(resp.text())
+        except Exception:
+            pass
 
-instance_type: Standard_DS3_v2
-instance_count: 1
+    err = getattr(e, "error", None)
+    if err is not None:
+        try:
+            print("\n--- error detail ---")
+            print(err)
+        except Exception:
+            pass
 
-request_settings:
-  request_timeout_ms: 180000
-  max_concurrent_requests_per_instance: 1
-
-environment_variables:
-  AZURE_OPENAI_ENDPOINT: "https://<twoj-resource>.openai.azure.com/"
-  AZURE_OPENAI_API_KEY: "<KEY1_LUB_KEY2_Z_AZURE_PORTAL>"
-  AZURE_OPENAI_API_VERSION: "2024-12-01-preview"
-  AZURE_OPENAI_CHAT_DEPLOYMENT: "gpt-5-mini"
-  AZURE_OPENAI_EMBED_DEPLOYMENT: "text-embedding-3-small"
-
-  TOP_K_RAG: "8"
-  MAX_LABELS_PER_CHUNK: "3"
-  MIN_KEEP_PROBA: "0.30"
-  MAX_TEXT_CHARS: "4000"
-
-
-
-###########
-
-az configure --defaults group="<RG>" workspace="<WORKSPACE>"
-az extension add -n ml -y 2>/dev/null || true
-
-az ml environment create -f environment.yml
+    raise
+except Exception as e:
+    print("\n=== Unknown error ===")
+    print(type(e), str(e))
+    raise
 
 
-az ml online-deployment create -f deployment.yml
 
-
-az ml online-deployment create -f deployment.yml \
-  --set environment_variables.AZURE_OPENAI_API_KEY="$AZURE_OPENAI_API_KEY"
-
-
-az ml online-deployment get-logs --endpoint-name YOUR_EXISTING_ENDPOINT_NAME --name llm --lines 200
-
-
-SCORING_URI=$(az ml online-endpoint show --name YOUR_EXISTING_ENDPOINT_NAME --query scoring_uri -o tsv)
-ENDPOINT_KEY=$(az ml online-endpoint get-credentials --name YOUR_EXISTING_ENDPOINT_NAME --query primaryKey -o tsv)
-
-
-curl -sS "$SCORING_URI" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ENDPOINT_KEY" \
-  --data-binary @sample_request.json
-
-
-az ml online-endpoint update --name YOUR_EXISTING_ENDPOINT_NAME --traffic "llm=10"
-
-
-az ml online-endpoint update --name YOUR_EXISTING_ENDPOINT_NAME --traffic "llm=100"
-
-
-############3
-
-{
-  "document": {
-    "contentDomain": {
-      "byId": {
-        "c1": {"text": "Motor frame shall be connected to protective earth (PE)."},
-        "c2": {"text": "Minimum degree of protection shall be IP55."},
-        "c3": {"text": "Marketing description only."}
-      }
-    }
-  },
-  "num_preds": 3
-}
