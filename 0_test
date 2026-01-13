@@ -1,3 +1,4 @@
+# score.py
 import json
 import logging
 import os
@@ -14,8 +15,17 @@ except Exception:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("score")
 
-# Default: keep MOCK on if you want deterministic local-ish behavior
+# -------------------------
+# Safety-first knobs
+# -------------------------
 USE_MOCK = os.getenv("USE_MOCK", "1").strip() == "1"
+
+MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "4"))
+# Lower to get *any* highlights first; tune up later
+MIN_PROBA = float(os.getenv("MIN_PROBA", "0.15"))
+# If AOAI returns relevance below this, we still allow predictions if model provided them
+AOAI_REL_THRESHOLD = float(os.getenv("AOAI_REL_THRESHOLD", "0.30"))
+MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))  # set 2-3 temporarily if needed
 
 client = None
 CHAT_DEPLOYMENT = None
@@ -23,11 +33,10 @@ CHAT_DEPLOYMENT = None
 DEMANDS: List[Dict[str, str]] = []         # [{id, demand, description}]
 DEMAND_TOKENS: List[Tuple[str, set]] = []  # [(demand_id, tokenset)]
 
-MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "4"))
-MIN_PROBA = float(os.getenv("MIN_PROBA", "0.30"))          # keep consistent with your rules
-MIN_RELEVANCE = float(os.getenv("MIN_RELEVANCE", "0.30"))  # highlight threshold-ish
 
-
+# -------------------------
+# Helpers
+# -------------------------
 def _json_load_maybe(x: Any) -> Any:
     if isinstance(x, (bytes, bytearray)):
         x = x.decode("utf-8", errors="replace")
@@ -66,9 +75,11 @@ def _load_demands_xlsx() -> List[Dict[str, str]]:
             df = pd.read_excel(p)
             df.columns = [c.strip().lower() for c in df.columns]
 
-            # allow both naming variants
+            # accept id naming variants
             if "demand_id" not in df.columns and "id" in df.columns:
                 df = df.rename(columns={"id": "demand_id"})
+            if "description" not in df.columns and "demand_description" in df.columns:
+                df = df.rename(columns={"demand_description": "description"})
 
             required = {"demand_id", "demand", "description"}
             missing = required - set(df.columns)
@@ -77,16 +88,18 @@ def _load_demands_xlsx() -> List[Dict[str, str]]:
                     f"demands.xlsx missing columns: {sorted(list(missing))}. Found: {list(df.columns)}"
                 )
 
-            out = []
+            out: List[Dict[str, str]] = []
             for _, r in df.fillna("").iterrows():
                 did = str(r["demand_id"]).strip()
                 if not did or did.lower() == "nan":
                     continue
-                out.append({
-                    "id": did,
-                    "demand": str(r["demand"]).strip(),
-                    "description": str(r["description"]).strip(),
-                })
+                out.append(
+                    {
+                        "id": did,
+                        "demand": str(r["demand"]).strip(),
+                        "description": str(r["description"]).strip(),
+                    }
+                )
             logger.info("Loaded %d demands from %s", len(out), p)
             return out
 
@@ -108,10 +121,14 @@ def _build_demand_tokens():
         DEMAND_TOKENS.append((d["id"], toks))
 
 
+# -------------------------
+# Predictors
+# -------------------------
 def _mock_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
     """
-    Keyword/token overlap against EACH demand's (demand+description) tokens.
-    Returns preds as [{label:<demand_id>, proba:<float>}]
+    Token overlap against (demand+description). Returns:
+      relevance float,
+      preds [{label:<demand_id>, proba:<float>}]
     """
     t = (text or "").strip()
     if len(t) < MIN_CHUNK_LEN:
@@ -129,27 +146,32 @@ def _mock_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
         if overlap <= 0:
             continue
 
-        # prosta funkcja "prawdopodobieństwa"
-        proba = 1.0 - (0.4 ** overlap)
+        # permissive curve
+        proba = 1.0 - (0.45 ** overlap)
         proba = max(0.0, min(0.99, float(proba)))
-        scored.append((did, proba))
+        if proba >= MIN_PROBA:
+            scored.append((did, proba))
 
     if not scored:
         return 0.10, []
 
     scored.sort(key=lambda x: x[1], reverse=True)
     preds = [{"label": did, "proba": float(round(p, 4))} for did, p in scored[:max(1, int(top_k))]]
-
     relevance = float(round(max(p for _, p in scored), 4))
     return relevance, preds
 
 
 def _aoai_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Returns:
+      relevance float,
+      preds [{label:<demand_id>, proba:<float>}]
+    """
     t = (text or "").strip()
     if len(t) < MIN_CHUNK_LEN:
         return 0.0, []
 
-    # katalog: ID + demand + skrót opisu
+    # Compact catalog
     lines = []
     for d in DEMANDS:
         desc = d["description"] or ""
@@ -158,7 +180,7 @@ def _aoai_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
         lines.append(f'{d["id"]}: {d["demand"]} | {desc}')
     catalog = "\n".join(lines)
 
-    system = "Return STRICT JSON only. No prose."
+    system = "Return STRICT JSON only. No prose. No markdown."
     user = f"""
 TEXT:
 {t}
@@ -174,15 +196,14 @@ Return JSON ONLY:
 
 Rules:
 - relevantProba: 0..1
-- If relevantProba < 0.5 => predictions must be []
-- Otherwise return up to {top_k} predictions sorted by probability desc
+- Return up to {top_k} predictions sorted by probability desc
 - prediction.id MUST be one of DEMANDS ids
+- Do NOT invent ids
 """.strip()
 
     resp = client.chat.completions.create(
         model=CHAT_DEPLOYMENT,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
     )
 
@@ -197,9 +218,12 @@ Rules:
     raw_preds = data.get("predictions", []) or []
 
     allowed = {d["id"] for d in DEMANDS}
-    preds = []
-    if rel >= 0.5:
-        for p in raw_preds[:max(1, int(top_k))]:
+    preds: List[Dict[str, Any]] = []
+
+    if isinstance(raw_preds, list):
+        for p in raw_preds[: max(1, int(top_k))]:
+            if not isinstance(p, dict):
+                continue
             did = str(p.get("id", "")).strip()
             try:
                 prob = float(p.get("probability"))
@@ -211,7 +235,16 @@ Rules:
                     preds.append({"label": did, "proba": prob})
 
     preds.sort(key=lambda x: x["proba"], reverse=True)
+
+    # If model says very low relevance, we still keep preds if present (to enable highlight debugging)
     rel = max(0.0, min(1.0, rel))
+    if rel < AOAI_REL_THRESHOLD and not preds:
+        return rel, []
+
+    # Relevance should not be lower than top prediction if there is one
+    if preds:
+        rel = max(rel, float(preds[0]["proba"]))
+
     return rel, preds
 
 
@@ -221,14 +254,17 @@ def _predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
     return _aoai_predict(text, top_k)
 
 
-# ===== AML entrypoints =====
+# -------------------------
+# AML entrypoints
+# -------------------------
 def init():
     global client, CHAT_DEPLOYMENT, DEMANDS, USE_MOCK
 
     USE_MOCK = os.getenv("USE_MOCK", "1").strip() == "1"
     DEMANDS = _load_demands_xlsx()
     _build_demand_tokens()
-    logger.info("init(): USE_MOCK=%s, demands=%d", USE_MOCK, len(DEMANDS))
+
+    logger.info("init(): USE_MOCK=%s demands=%d", USE_MOCK, len(DEMANDS))
 
     if not USE_MOCK:
         if AzureOpenAI is None:
@@ -240,15 +276,13 @@ def init():
 
         CHAT_DEPLOYMENT = (
             os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
-            or os.getenv("CHAT_DEPLOYMENT", "").strip()
             or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
         )
 
         if not (aoai_endpoint and aoai_key and CHAT_DEPLOYMENT):
             raise RuntimeError(
                 "Missing AOAI env vars. Need: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-                "AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT). "
-                "Optionally AZURE_OPENAI_API_VERSION."
+                "AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT)."
             )
 
         client = AzureOpenAI(
@@ -260,18 +294,14 @@ def init():
 
 def run(raw_data):
     """
-    Input from app:
-      { "document": <obj or json-string>, "model": "...", "num_preds": 3 }
-
-    Output for app (must match working contract):
+    Contract (must not crash app):
       { "predictions": <document> }
-
-    And document MUST contain:
-      documentDemandPredictions: ["id1","id2", ...]  <-- ARRAY OF STRINGS (critical)
-      + per chunk:
-        relevantProba: float
-        cdTransformerPredictions: [{label:<demand_id>, proba:<float>}]
-        cdLogregPredictions: [] or same shape
+    document MUST include:
+      documentDemandPredictions: ["id1","id2", ...]  (ARRAY OF STRINGS)
+    and per chunk:
+      relevantProba: float
+      cdTransformerPredictions: [{label, proba}]
+      cdLogregPredictions: SAME SHAPE (mirror)  <-- critical for your UI
     """
     try:
         req = _json_load_maybe(raw_data)
@@ -290,36 +320,44 @@ def run(raw_data):
 
         by_id = _find_content_byid(document)
 
-        # Collect best doc-level probs, but return IDs only (strings)
-        best_doc_probs: Dict[str, float] = {}
+        if MAX_DEBUG_CHUNKS > 0:
+            logger.info("run(): USE_MOCK=%s chunks=%d num_preds=%d", USE_MOCK, len(by_id), num_preds)
 
-        for _, content in by_id.items():
+        best_doc_probs: Dict[str, float] = {}
+        debug_left = MAX_DEBUG_CHUNKS
+
+        for cid, content in by_id.items():
             if not isinstance(content, dict):
                 continue
 
             text = content.get("text", "")
+            if debug_left > 0:
+                logger.info("chunk=%s text_sample=%r", cid, (str(text)[:180] if text is not None else None))
+                debug_left -= 1
+
             rel, preds = _predict(text, top_k=num_preds)
 
-            # These fields drive highlighting in your UI
+            # Always set expected keys/types
             content["relevantProba"] = float(rel)
-            content["cdLogregPredictions"] = []          # keep compatible; can mirror later
-            content["cdTransformerPredictions"] = preds  # [{label, proba}]
+            content["cdTransformerPredictions"] = preds if isinstance(preds, list) else []
+            # CRITICAL: mirror to logreg for UI selection logic
+            content["cdLogregPredictions"] = list(content["cdTransformerPredictions"])
 
-            # Aggregate document-level ids
-            for p in preds:
-                did = p["label"]
-                prob = float(p["proba"])
-                if did not in best_doc_probs or prob > best_doc_probs[did]:
+            for p in content["cdTransformerPredictions"]:
+                try:
+                    did = str(p.get("label"))
+                    prob = float(p.get("proba", 0.0))
+                except Exception:
+                    continue
+                if did and (did not in best_doc_probs or prob > best_doc_probs[did]):
                     best_doc_probs[did] = prob
 
-        # CRITICAL FIX: app expects ARRAY OF STRINGS, not [{id, probability}]
-        # Use a threshold consistent with per-chunk filter.
-        ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True) if v >= MIN_PROBA]
+        # Document-level: ARRAY OF STRINGS (IDs only), sorted by confidence
+        ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True)]
         document["documentDemandPredictions"] = ids_sorted[:num_preds]
 
         return {"predictions": document}
 
     except Exception as e:
         logger.exception("run() failed")
-        # Never break downstream: always include predictions/documentDemandPredictions
         return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
