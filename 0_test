@@ -1,345 +1,389 @@
-import os
+# score.py
 import json
-import time
 import logging
-from typing import Any, Dict, List, Optional
-
-import pandas as pd
-from openai import AzureOpenAI
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Azure OpenAI client
-_client: Optional[AzureOpenAI] = None
-_deployment: Optional[str] = None
-
-# Demands (loaded from local file next to score.py)
-_demands: List[Dict[str, str]] = []  # {"id":..., "name":..., "description":...}
-
+# Globals (Azure ML calls init() once)
+DEMANDS: List[Dict[str, str]] = []
+CLIENT = None
 
 # ----------------------------
-# Utilities (hardening)
+# Demands loading (local рядом score.py)
 # ----------------------------
-def _this_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _ensure_list_of_strings(x: Any) -> List[str]:
-    """
-    CRITICAL: application expects JSON array of strings.
-    If x is list of dicts -> extract "id".
-    If x is a single string -> wrap into [string].
-    Otherwise -> [].
-    """
-    if x is None:
-        return []
-    if isinstance(x, str):
-        s = x.strip()
-        return [s] if s else []
-    if isinstance(x, list):
-        out: List[str] = []
-        for item in x:
-            if isinstance(item, str):
-                s = item.strip()
-                if s:
-                    out.append(s)
-            elif isinstance(item, dict):
-                # if someone mistakenly returns [{"id": "...", "probability": ...}]
-                s = str(item.get("id", "")).strip()
-                if s:
-                    out.append(s)
-        return out
-    # sets, tuples, etc.
-    try:
-        return [str(v).strip() for v in list(x) if str(v).strip()]
-    except Exception:
-        return []
-
-
-def _safe_json_loads(s: str) -> Optional[Any]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def _find_demands_file() -> str:
-    base = _this_dir()
-    # Demands obok score.py (jak u Ciebie)
-    for name in ["demands.xlsx", "demands.csv", "demands.json"]:
-        p = os.path.join(base, name)
-        if os.path.isfile(p):
-            return p
-    raise FileNotFoundError("Missing demands file next to score.py (demands.xlsx/csv/json).")
-
-
-def _load_demands() -> List[Dict[str, str]]:
-    """
-    Your Excel: demand_id, demand, demand_description
-    We use demand_description for context, but output always uses demand_id.
-    """
-    path = _find_demands_file()
-    logger.info(f"Loading demands from: {path}")
-
-    if path.endswith(".xlsx"):
-        df = pd.read_excel(path)
-    elif path.endswith(".csv"):
-        df = pd.read_csv(path)
-    elif path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "demands" in data:
-            data = data["demands"]
-        out = []
-        for d in data if isinstance(data, list) else []:
-            if not isinstance(d, dict):
-                continue
-            did = str(d.get("demand_id") or d.get("id") or "").strip()
-            name = str(d.get("demand") or d.get("name") or "").strip()
-            desc = str(d.get("demand_description") or d.get("description") or d.get("clarification") or "").strip()
-            if did:
-                out.append({"id": did, "name": name, "description": desc})
-        return out
-    else:
-        raise ValueError("Unsupported demands file type.")
-
-    # Normalize DF
-    cols = {c.strip() for c in df.columns}
-    req = {"demand_id", "demand", "demand_description"}
-    missing = req - cols
-    if missing:
-        raise ValueError(f"Demands missing columns: {sorted(missing)}")
-
+def _normalize_demands(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    for _, row in df.iterrows():
-        did = str(row["demand_id"]).strip()
-        name = str(row["demand"]).strip()
-        desc = str(row["demand_description"]).strip()
-        if did:
-            out.append({"id": did, "name": name, "description": desc})
+    for r in rows:
+        # Support your Excel naming: demand_id, demand, demand_description
+        did = r.get("id") or r.get("demand_id") or r.get("demandId")
+        demand = r.get("demand") or r.get("name") or r.get("label")
+        desc = r.get("description") or r.get("demand_description") or r.get("clarification") or ""
+
+        if did is None:
+            continue
+
+        out.append(
+            {
+                "id": str(did).strip(),
+                "demand": ("" if demand is None else str(demand).strip()),
+                "description": ("" if desc is None else str(desc).strip()),
+            }
+        )
     return out
 
 
-def _demands_context(demands: List[Dict[str, str]]) -> str:
-    # Keep compact; description is key for match
-    return "\n".join(
-        f"- ID: {d['id']}\n  Name: {d['name']}\n  Clarification: {d['description']}"
-        for d in demands
+def _load_demands_from_xlsx(path: Path) -> List[Dict[str, str]]:
+    try:
+        import pandas as pd
+    except Exception as e:
+        raise RuntimeError("pandas is required to load demands.xlsx") from e
+
+    df = pd.read_excel(path)
+    df = df.fillna("")
+    rows = df.to_dict(orient="records")
+    return _normalize_demands(rows)
+
+
+def _load_demands_from_csv(path: Path) -> List[Dict[str, str]]:
+    try:
+        import pandas as pd
+    except Exception as e:
+        raise RuntimeError("pandas is required to load demands.csv") from e
+
+    df = pd.read_csv(path)
+    df = df.fillna("")
+    rows = df.to_dict(orient="records")
+    return _normalize_demands(rows)
+
+
+def _load_demands_from_json(path: Path) -> List[Dict[str, str]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "demands" in data and isinstance(data["demands"], list):
+        rows = data["demands"]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = []
+    return _normalize_demands(rows)
+
+
+def _load_demands_table() -> List[Dict[str, str]]:
+    # You said: demands are in the same folder as score.py (and .env), not in model_dir.
+    here = Path(__file__).resolve().parent
+
+    # Optional override
+    dem_path = os.getenv("DEMANDS_PATH")
+    candidates: List[Path] = []
+    if dem_path:
+        candidates.append(Path(dem_path))
+
+    # Standard local candidates (same folder)
+    candidates.extend(
+        [
+            here / "demands.xlsx",
+            here / "demands.csv",
+            here / "demands.json",
+        ]
+    )
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            if p.suffix.lower() == ".xlsx":
+                dem = _load_demands_from_xlsx(p)
+            elif p.suffix.lower() == ".csv":
+                dem = _load_demands_from_csv(p)
+            elif p.suffix.lower() == ".json":
+                dem = _load_demands_from_json(p)
+            else:
+                continue
+
+            if dem:
+                logger.info(f"Loaded demands from: {p} (count={len(dem)})")
+                return dem
+
+    raise RuntimeError(
+        f"Could not find demands file. Put demands.xlsx/csv/json next to score.py "
+        f"or set DEMANDS_PATH. Looked in: {here}"
     )
 
 
-def _prompt(demands_ctx: str, chunk_id: str, chunk_text: str, topn: int) -> str:
-    # Single-chunk prompt: less token bloat, less chaos
-    # Still based on your rules: match only when Clarification aligns.
+def _build_demands_context(demands: List[Dict[str, str]]) -> str:
+    # Short but strong: id + demand name + description (you said description is key)
+    lines = []
+    for d in demands:
+        did = d["id"]
+        name = d.get("demand", "")
+        desc = d.get("description", "")
+        lines.append(f"- id: {did}\n  name: {name}\n  description: {desc}")
+    return "\n".join(lines)
+
+
+# ----------------------------
+# Azure OpenAI client
+# ----------------------------
+def _init_openai_client():
+    # Supports latest "openai" SDK style for Azure:
+    # pip install openai
+    try:
+        from openai import AzureOpenAI
+    except Exception as e:
+        raise RuntimeError("Python package 'openai' is required in the environment.") from e
+
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+
+    if not endpoint or not api_key:
+        raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY")
+
+    return AzureOpenAI(azure_endpoint=endpoint, api_key=api_key, api_version=api_version)
+
+
+def init():
+    """
+    Called once by Azure ML.
+    """
+    global DEMANDS, CLIENT
+    logger.info("Initializing OpenAI-based scoring...")
+    DEMANDS = _load_demands_table()
+    if not DEMANDS:
+        raise RuntimeError("Demands table is empty after loading.")
+    CLIENT = _init_openai_client()
+
+    if not os.getenv("AZURE_OPENAI_DEPLOYMENT"):
+        raise RuntimeError("Missing AZURE_OPENAI_DEPLOYMENT (name of Azure OpenAI deployment).")
+
+    logger.info("Initialization finished successfully.")
+
+
+# ----------------------------
+# Contract helpers: request/response must remain 1:1
+# ----------------------------
+def _parse_request(raw_data: Any) -> Tuple[Dict[str, Any], int]:
+    """
+    Expected request (from your C#):
+      { "document": <JSON object>, "num_preds": <int> }
+    """
+    if raw_data is None:
+        raise ValueError("Bad Request: body is empty")
+
+    if isinstance(raw_data, (bytes, bytearray)):
+        raw_data = raw_data.decode("utf-8")
+
+    if isinstance(raw_data, str):
+        raw_data = raw_data.strip()
+        if not raw_data:
+            raise ValueError("Bad Request: body is empty")
+        req = json.loads(raw_data)
+    elif isinstance(raw_data, dict):
+        req = raw_data
+    else:
+        # AML sometimes passes already-parsed payload in unexpected type; fail fast
+        raise ValueError(f"Bad Request: unsupported body type: {type(raw_data)}")
+
+    if "document" not in req or "num_preds" not in req:
+        raise ValueError("Bad Request: expected fields 'document' and 'num_preds'.")
+
+    document = req["document"]
+    if not isinstance(document, dict):
+        raise ValueError("Bad Request: 'document' must be a JSON object.")
+
+    try:
+        num_preds = int(req["num_preds"])
+    except Exception:
+        num_preds = 3
+    num_preds = max(1, min(10, num_preds))
+    return document, num_preds
+
+
+def _iter_chunks(document: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Old code iterated: document['contentDomain']['byId'].values()
+    Keep same structure.
+    """
+    cd = document.get("contentDomain") or {}
+    by_id = cd.get("byId") or {}
+    if not isinstance(by_id, dict):
+        return []
+    chunks: List[Tuple[str, Dict[str, Any]]] = []
+    for cid, obj in by_id.items():
+        if isinstance(obj, dict):
+            chunks.append((str(cid), obj))
+    return chunks
+
+
+# ----------------------------
+# LLM prompt: aligned with your screenshots (rules + demands + chunks)
+# ----------------------------
+def _prompt_for_chunk(demands_context: str, chunk_text: str, num_preds: int) -> str:
+    # This prompt returns per-chunk demandIds with probabilities.
+    # We will still convert global output to STRING IDs only (contract).
     return f"""
-Rules:
-- Use ONLY demand IDs from the list below
-- Match ONLY when chunk aligns with demand Clarification (WHEN)
-- Max {topn} demands
-- If none, return empty list
-- Return JSON ONLY
+You are an assistant for bid engineers. You classify whether a given text chunk contains requirements that match any of the predefined demands.
 
-Demands:
-{demands_ctx}
+**Rules & Constraints:**
+- The demand **Name** tells WHAT equipment this applies to
+- The **Description** tells WHEN to match (specific requirement criteria)
+- Match ONLY when the chunk content aligns with the demand's description
+- You MUST use only the predefined demands from the list provided
+- Find maximum {num_preds} demands for the chunk
+- If no relevant demands found, return empty demandIds array
+- Probability scale (0.0 to 1.0):
+  - 1.0: direct explicit match
+  - 0.7-0.9: strong semantic relationship
+  - 0.5-0.7: moderate relationship
+  - 0.3-0.5: weak relationship
+  - below 0.3: not relevant (exclude)
 
-ChunkId: "{chunk_id}"
-Text: "{chunk_text}"
+**Demands:**
+{demands_context}
 
-Return JSON:
+**Text Chunk to analyze:**
+{chunk_text}
+
+Respond with valid JSON in this format:
 {{
   "demandIds": [{{"id":"demand_id","probability":0.85}}],
-  "explanation": "brief"
+  "explanation": "brief explanation"
 }}
 """.strip()
 
 
-def _call_llm(prompt: str) -> Dict[str, Any]:
-    assert _client is not None and _deployment is not None
-    resp = _client.chat.completions.create(
-        model=_deployment,
+def _call_openai_for_chunk(chunk_text: str, demands_context: str, num_preds: int) -> Dict[str, Any]:
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    assert CLIENT is not None
+
+    prompt = _prompt_for_chunk(demands_context, chunk_text, num_preds)
+
+    # Use chat.completions to be broadly compatible
+    resp = CLIENT.chat.completions.create(
+        model=deployment,
         messages=[
-            {"role": "system", "content": "Return ONLY valid JSON. No markdown, no prose."},
+            {"role": "system", "content": "Return ONLY valid JSON. No markdown."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.0,
-        max_tokens=600,
     )
-    content = (resp.choices[0].message.content or "").strip()
-    # robust parse
+
+    text = (resp.choices[0].message.content or "").strip()
+    # Parse safely: ensure JSON object
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        s = content.find("{")
-        e = content.rfind("}")
-        if s >= 0 and e > s:
-            return json.loads(content[s:e+1])
-        return {"demandIds": [], "explanation": "parse_error"}
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # Hard fallback (never break contract)
+    return {"demandIds": [], "explanation": "model returned non-JSON or invalid JSON"}
 
 
-def init():
-    global _client, _deployment, _demands
-    logger.info("init() starting")
+# ----------------------------
+# Core inference: KEEP OUTPUT/INPUT NAMES 1:1
+# ----------------------------
+def inference(document: Dict[str, Any], num_preds: int) -> Dict[str, Any]:
+    """
+    MUST keep compatibility with old app:
+    - document["documentDemandPredictions"] MUST BE JSON ARRAY OF STRINGS (DEMAND IDS)
+    - per chunk update: relevantProba, cdLogregPredictions, cdTransformerPredictions
+    """
+    start = time.time()
 
-    _demands = _load_demands()
-    if not _demands:
-        raise RuntimeError("Demands list is empty.")
+    chunks = _iter_chunks(document)
+    if not chunks:
+        document["documentDemandPredictions"] = []
+        return document
 
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
-    _deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+    demands_context = _build_demands_context(DEMANDS)
 
-    missing = [k for k, v in {
-        "AZURE_OPENAI_ENDPOINT": endpoint,
-        "AZURE_OPENAI_API_KEY": api_key,
-        "AZURE_OPENAI_API_VERSION": api_version,
-        "AZURE_OPENAI_DEPLOYMENT": _deployment,
-    }.items() if not v]
-    if missing:
-        raise RuntimeError(f"Missing env vars: {missing}")
+    global_ids = set()
 
-    _client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-    logger.info("init() completed")
+    for cid, content in chunks:
+        chunk_text = str(content.get("text") or "")
+        if len(chunk_text.split()) <= 2:
+            content.update(
+                {
+                    "relevantProba": 0.0,
+                    "cdLogregPredictions": [],
+                    "cdTransformerPredictions": [],
+                }
+            )
+            continue
+
+        llm = _call_openai_for_chunk(chunk_text, demands_context, num_preds)
+        demand_ids = llm.get("demandIds", [])
+        if not isinstance(demand_ids, list):
+            demand_ids = []
+
+        # Convert to old-style per-chunk predictions:
+        # cdTransformerPredictions: [{label, proba}]
+        cd_transformer_predictions: List[Dict[str, Any]] = []
+        for x in demand_ids:
+            if not isinstance(x, dict):
+                continue
+            did = x.get("id")
+            proba = x.get("probability")
+            if did is None:
+                continue
+            try:
+                p = float(proba)
+            except Exception:
+                p = 0.0
+            # Filter low relevance (below 0.3 per your rules)
+            if p < 0.3:
+                continue
+            cd_transformer_predictions.append({"label": str(did), "proba": p})
+
+        cd_transformer_predictions = cd_transformer_predictions[:num_preds]
+
+        top_p = cd_transformer_predictions[0]["proba"] if cd_transformer_predictions else 0.0
+        relevant_proba = float(top_p)
+
+        # Keep cdLogregPredictions shape too (mirror)
+        cd_logreg_predictions = list(cd_transformer_predictions)
+
+        # Add to global list only if strong enough (conservative)
+        if cd_transformer_predictions and relevant_proba >= 0.7:
+            global_ids.add(cd_transformer_predictions[0]["label"])
+
+        content.update(
+            {
+                "relevantProba": relevant_proba,
+                "cdLogregPredictions": cd_logreg_predictions,
+                "cdTransformerPredictions": cd_transformer_predictions,
+            }
+        )
+
+    # CRITICAL: this must be ARRAY OF STRINGS (not objects!)
+    document["documentDemandPredictions"] = sorted(list(global_ids))
+
+    logger.info(f"Time to format results: {time.time() - start}")
+    return document
 
 
 def run(raw_data):
     """
-    HARD RULES:
-    - never throw (avoid 500 -> app crash)
-    - always return JSON object
-    - always ensure documentDemandPredictions is JSON array of strings
+    Azure ML entrypoint.
+    Your C# reads either:
+      json["predictions"]["documentDemandPredictions"]
+    or
+      json["documentDemandPredictions"]
+
+    So we return wrapper: {"predictions": <document>}
     """
-    t0 = time.time()
-
-    # Default minimal safe response (if anything goes wrong)
-    safe_doc = {"documentDemandPredictions": []}
-    safe_response = {"predictions": safe_doc, "documentDemandPredictions": []}
-
     try:
-        # Parse request
-        if raw_data is None:
-            logger.warning("Empty request body")
-            return safe_response
+        document, num_pred = _parse_request(raw_data)
+        result_doc = inference(document, num_pred)
 
-        if isinstance(raw_data, (bytes, bytearray)):
-            raw_data = raw_data.decode("utf-8", errors="ignore")
-
-        if isinstance(raw_data, str):
-            req = _safe_json_loads(raw_data)
-            if req is None:
-                logger.warning("Invalid JSON request")
-                return safe_response
-        elif isinstance(raw_data, dict):
-            req = raw_data
-        else:
-            logger.warning(f"Unsupported request type: {type(raw_data)}")
-            return safe_response
-
-        document = req.get("document", None)
-        num_preds = req.get("num_preds", None)
-
-        if document is None or num_preds is None:
-            logger.warning("Missing 'document' or 'num_preds'")
-            return safe_response
-
-        try:
-            topn = int(num_preds)
-        except Exception:
-            topn = 3
-
-        # Document can be stringified JSON
-        if isinstance(document, str):
-            parsed = _safe_json_loads(document)
-            if isinstance(parsed, dict):
-                document = parsed
-
-        if not isinstance(document, dict):
-            logger.warning("document is not an object")
-            return safe_response
-
-        # Ensure structure exists
-        by_id = document.get("contentDomain", {}).get("byId", {})
-        if not isinstance(by_id, dict):
-            # Still return with empty array to not break app
-            document["documentDemandPredictions"] = []
-            out = {"predictions": document, "documentDemandPredictions": []}
-            return out
-
-        demands_ctx = _demands_context(_demands)
-
-        global_ids: List[str] = []
-        global_set = set()
-
-        # Iterate each content chunk (1:1 with legacy)
-        for _, content in by_id.items():
-            if not isinstance(content, dict):
-                continue
-            cid = str(content.get("id", "")).strip()
-            txt = str(content.get("text", "") or "").replace("\n", " ").strip()
-
-            # Always attach fields expected by UI (even if empty)
-            content.setdefault("relevantProba", 0.0)
-            content.setdefault("cdLogregPredictions", [])
-            content.setdefault("cdTransformerPredictions", [])
-
-            if not cid or not txt:
-                continue
-
-            # Call LLM per chunk (simple, stable)
-            llm = _call_llm(_prompt(demands_ctx, cid, txt, topn))
-
-            demand_ids = llm.get("demandIds", [])
-            # Normalize demandIds -> predictions lists
-            normalized = []
-            if isinstance(demand_ids, list):
-                for di in demand_ids:
-                    if not isinstance(di, dict):
-                        continue
-                    did = str(di.get("id", "")).strip()
-                    try:
-                        prob = float(di.get("probability", 0.0))
-                    except Exception:
-                        prob = 0.0
-                    if not did or prob < 0.3:
-                        continue
-                    normalized.append({"label": did, "proba": max(0.0, min(1.0, prob))})
-
-            normalized.sort(key=lambda x: x["proba"], reverse=True)
-            normalized = normalized[: max(1, topn)]
-
-            # Attach per chunk (UI/debug)
-            content["cdTransformerPredictions"] = normalized
-            content["cdLogregPredictions"] = [{"label": p["label"], "proba": p["proba"] * 0.85} for p in normalized]
-            content["relevantProba"] = float(normalized[0]["proba"]) if normalized else 0.0
-
-            # Global IDs: ONLY STRINGS (CRITICAL)
-            if normalized:
-                did = str(normalized[0]["label"]).strip()
-                if did and did not in global_set:
-                    global_set.add(did)
-
-        global_ids = list(global_set)
-
-        # CRITICAL: documentDemandPredictions MUST be array of strings
-        document["documentDemandPredictions"] = _ensure_list_of_strings(global_ids)
-
-        out = {
-            "predictions": document,
-            # extra top-level fallback (doesn't hurt, helps)
-            "documentDemandPredictions": document["documentDemandPredictions"],
-        }
-
-        logger.info(f"run() OK in {time.time()-t0:.3f}s, ids={len(document['documentDemandPredictions'])}")
-        return out
+        # Must be dict to preserve structure
+        return {"predictions": result_doc}
 
     except Exception as e:
-        # Never fail the endpoint contract; return safe structure
-        logger.error(f"run() failed but returning safe response: {str(e)}", exc_info=True)
-        return safe_response
-
-
+        logger.error(f"Scoring failed: {str(e)}", exc_info=True)
+        # Never break downstream: return empty correct shape
+        return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
