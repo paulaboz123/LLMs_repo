@@ -1,4 +1,3 @@
-# score.py
 import json
 import logging
 import os
@@ -16,16 +15,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("score")
 
 # -------------------------
-# Safety-first knobs
+# Knobs (tune via env, no redeploy)
 # -------------------------
 USE_MOCK = os.getenv("USE_MOCK", "1").strip() == "1"
 
-MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "4"))
-# Lower to get *any* highlights first; tune up later
-MIN_PROBA = float(os.getenv("MIN_PROBA", "0.15"))
-# If AOAI returns relevance below this, we still allow predictions if model provided them
-AOAI_REL_THRESHOLD = float(os.getenv("AOAI_REL_THRESHOLD", "0.30"))
-MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))  # set 2-3 temporarily if needed
+MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "10"))
+
+MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))
+
+# Classification quality gates
+LABEL_MIN_PROB = float(os.getenv("LABEL_MIN_PROB", "0.75"))          # label assigned only if >= this
+HIGHLIGHT_MIN_PROB = float(os.getenv("HIGHLIGHT_MIN_PROB", "0.80"))  # highlight only if top1 >= this
+RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.60"))            # requirement gate relevance threshold
+
+MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))           # set 2-3 temporarily
 
 client = None
 CHAT_DEPLOYMENT = None
@@ -33,10 +36,18 @@ CHAT_DEPLOYMENT = None
 DEMANDS: List[Dict[str, str]] = []         # [{id, demand, description}]
 DEMAND_TOKENS: List[Tuple[str, set]] = []  # [(demand_id, tokenset)]
 
+# simple requirement heuristics for MOCK
+REQ_MODAL_RE = re.compile(
+    r"\b(shall|must|required|requirement|should|need to|has to|may not|must not|shall not|prohibit|forbidden)\b",
+    re.IGNORECASE,
+)
+REQ_PL_MODAL_RE = re.compile(
+    r"\b(musi|należy|wymaga|wymagane|powinien|powinna|zakazuje|zabrania|nie wolno|dopuszcza się|wymóg)\b",
+    re.IGNORECASE,
+)
+REQ_NUM_RE = re.compile(r"\b\d+([.,]\d+)?\b")
 
-# -------------------------
-# Helpers
-# -------------------------
+
 def _json_load_maybe(x: Any) -> Any:
     if isinstance(x, (bytes, bytearray)):
         x = x.decode("utf-8", errors="replace")
@@ -75,7 +86,7 @@ def _load_demands_xlsx() -> List[Dict[str, str]]:
             df = pd.read_excel(p)
             df.columns = [c.strip().lower() for c in df.columns]
 
-            # accept id naming variants
+            # accept naming variants
             if "demand_id" not in df.columns and "id" in df.columns:
                 df = df.rename(columns={"id": "demand_id"})
             if "description" not in df.columns and "demand_description" in df.columns:
@@ -121,90 +132,168 @@ def _build_demand_tokens():
         DEMAND_TOKENS.append((d["id"], toks))
 
 
-# -------------------------
-# Predictors
-# -------------------------
-def _mock_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
+def _is_requirement_heuristic(text: str) -> Tuple[bool, float]:
     """
-    Token overlap against (demand+description). Returns:
-      relevance float,
-      preds [{label:<demand_id>, proba:<float>}]
+    Conservative-ish gate:
+    - modal/obligation words OR numeric constraints -> likely requirement
     """
     t = (text or "").strip()
     if len(t) < MIN_CHUNK_LEN:
-        return 0.0, []
+        return False, 0.0
 
+    has_modal = bool(REQ_MODAL_RE.search(t) or REQ_PL_MODAL_RE.search(t))
+    has_num = bool(REQ_NUM_RE.search(t))
+    # basic relevance
+    if has_modal and has_num:
+        return True, 0.85
+    if has_modal:
+        return True, 0.70
+    if has_num:
+        return True, 0.60
+    return False, 0.15
+
+
+def _mock_predict(chunk_text: str, top_k: int) -> Dict[str, Any]:
+    """
+    Two-stage:
+      1) isRequirement + relevance
+      2) labels with evidence + criteriaMatched
+    """
+    is_req, rel = _is_requirement_heuristic(chunk_text)
+    if not is_req or rel < RELEVANCE_MIN:
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "gate_failed"}
+
+    t = (chunk_text or "").strip()
     text_tokens = _tokenize(t)
     if not text_tokens:
-        return 0.0, []
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "no_tokens"}
 
-    scored = []
-    for did, dtoks in DEMAND_TOKENS:
+    scored: List[Tuple[str, float, List[str]]] = []
+    for d in DEMANDS:
+        did = d["id"]
+        dtoks = _tokenize((d.get("demand") or "") + " " + (d.get("description") or ""))
         if not dtoks:
             continue
-        overlap = len(text_tokens & dtoks)
-        if overlap <= 0:
+        overlap = text_tokens & dtoks
+        if not overlap:
             continue
 
-        # permissive curve
-        proba = 1.0 - (0.45 ** overlap)
-        proba = max(0.0, min(0.99, float(proba)))
-        if proba >= MIN_PROBA:
-            scored.append((did, proba))
+        # convert overlap count -> probability (more conservative than before)
+        c = len(overlap)
+        prob = 1.0 - (0.55 ** c)   # slower growth => fewer positives
+        prob = max(0.0, min(0.99, float(prob)))
 
-    if not scored:
-        return 0.10, []
+        # must-match criteria: require at least 2 overlapping tokens (or 1 strong token if numeric exists)
+        has_num = bool(REQ_NUM_RE.search(t))
+        if c < 2 and not (has_num and c >= 1):
+            continue
+
+        # criteriaMatched = some overlapping tokens (as proxy for description conditions)
+        criteria = sorted(list(overlap))[:5]
+
+        scored.append((did, prob, criteria))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    preds = [{"label": did, "proba": float(round(p, 4))} for did, p in scored[:max(1, int(top_k))]]
-    relevance = float(round(max(p for _, p in scored), 4))
-    return relevance, preds
+    scored = scored[: max(1, min(int(top_k), MAX_LABELS_PER_CHUNK))]
+
+    # evidence: short quote from the chunk (first ~20 words)
+    words = t.split()
+    evidence = " ".join(words[:20]).strip()
+
+    labels = []
+    for did, prob, criteria in scored:
+        if prob < LABEL_MIN_PROB:
+            continue
+        if not evidence or not criteria:
+            continue
+        labels.append(
+            {
+                "id": did,
+                "probability": float(round(prob, 4)),
+                "evidence": evidence,
+                "criteriaMatched": criteria,
+            }
+        )
+
+    # If no labels after strict filters -> treat as not requirement for highlighting purposes
+    if not labels:
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "no_labels_after_filters"}
+
+    # Relevance should not be below top prob
+    rel = max(float(rel), float(labels[0]["probability"]))
+    return {"isRequirement": True, "relevance": float(rel), "labels": labels, "notes": "ok"}
 
 
-def _aoai_predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
-    """
-    Returns:
-      relevance float,
-      preds [{label:<demand_id>, proba:<float>}]
-    """
-    t = (text or "").strip()
+def _aoai_predict(chunk_text: str, top_k: int) -> Dict[str, Any]:
+    t = (chunk_text or "").strip()
     if len(t) < MIN_CHUNK_LEN:
-        return 0.0, []
+        return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "too_short"}
 
-    # Compact catalog
+    # compact catalog
     lines = []
     for d in DEMANDS:
         desc = d["description"] or ""
         if len(desc) > 180:
             desc = desc[:180] + "…"
+        # include explicit criteria hints (description is the "WHEN")
         lines.append(f'{d["id"]}: {d["demand"]} | {desc}')
     catalog = "\n".join(lines)
 
-    system = "Return STRICT JSON only. No prose. No markdown."
+    system = (
+        "You are a strict requirements classifier for bid/spec documents. "
+        "Return STRICT JSON only. No prose. No markdown. "
+        "Never invent demand IDs. "
+        "Do not label unless you can quote exact evidence from the chunk."
+    )
+
     user = f"""
-TEXT:
-{t}
+You must do TWO steps:
+
+STEP 1 — REQUIREMENT GATE:
+Decide if the chunk contains a concrete, verifiable requirement/specification that should be highlighted.
+A requirement typically contains obligation/constraint language (must/shall/należy/musi), parameters/limits (numbers/units), tests/acceptance, prohibitions, or explicit conditions.
+If it is NOT a requirement (overview/description/marketing/context/definition), set isRequirement=false and labels=[].
+
+STEP 2 — LABELING (only if isRequirement=true):
+Choose up to {min(int(top_k), MAX_LABELS_PER_CHUNK)} demand IDs from the list below.
+For EACH label you must:
+- Provide evidence: an exact short quote copied from the chunk (5–25 words).
+- Provide criteriaMatched: 1–3 short phrases/keywords corresponding to the DEMAND DESCRIPTION conditions (the "WHEN").
+- If you cannot identify criteriaMatched from the description, DO NOT label.
+- If you cannot quote evidence from the chunk, DO NOT label.
+- Only return labels with probability >= {LABEL_MIN_PROB}.
 
 DEMANDS (id: demand | description):
 {catalog}
 
-Return JSON ONLY:
+CHUNK:
+{t}
+
+Return JSON ONLY in this exact schema:
 {{
-  "relevantProba": 0.0,
-  "predictions": [{{"id":"<demand_id>", "probability":0.0}}]
+  "isRequirement": true,
+  "relevance": 0.0,
+  "labels": [
+    {{
+      "id": "<demand_id_from_list>",
+      "probability": 0.0,
+      "evidence": "<exact quote from chunk>",
+      "criteriaMatched": ["<phrase1>", "<phrase2>"]
+    }}
+  ],
+  "notes": "short"
 }}
 
-Rules:
-- relevantProba: 0..1
-- Return up to {top_k} predictions sorted by probability desc
-- prediction.id MUST be one of DEMANDS ids
-- Do NOT invent ids
+Calibration:
+- relevance: overall requirement confidence (0..1). If not requirement, keep it < {RELEVANCE_MIN}.
+- probability: label confidence (0..1). Use >= {LABEL_MIN_PROB} only for strong matches meeting description conditions.
 """.strip()
 
     resp = client.chat.completions.create(
         model=CHAT_DEPLOYMENT,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
+        max_tokens=900,
     )
 
     raw = (resp.choices[0].message.content or "").strip()
@@ -212,46 +301,75 @@ Rules:
         data = json.loads(raw)
     except Exception:
         logger.warning("AOAI returned non-JSON (truncated): %r", raw[:500])
-        return 0.0, []
+        return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "non_json"}
 
-    rel = float(data.get("relevantProba", 0.0) or 0.0)
-    raw_preds = data.get("predictions", []) or []
+    is_req = bool(data.get("isRequirement", False))
+    try:
+        rel = float(data.get("relevance", 0.0) or 0.0)
+    except Exception:
+        rel = 0.0
 
+    labels_raw = data.get("labels", []) or []
     allowed = {d["id"] for d in DEMANDS}
-    preds: List[Dict[str, Any]] = []
+    labels: List[Dict[str, Any]] = []
 
-    if isinstance(raw_preds, list):
-        for p in raw_preds[: max(1, int(top_k))]:
-            if not isinstance(p, dict):
+    # Gate: if model says not requirement OR relevance too low -> no labels
+    if (not is_req) or rel < RELEVANCE_MIN:
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "gate_failed"}
+
+    # Validate labels: id allowed, prob threshold, evidence present, criteriaMatched present
+    if isinstance(labels_raw, list):
+        for item in labels_raw[: max(1, min(int(top_k), MAX_LABELS_PER_CHUNK))]:
+            if not isinstance(item, dict):
                 continue
-            did = str(p.get("id", "")).strip()
+
+            did = str(item.get("id", "")).strip()
+            if did not in allowed:
+                continue
+
             try:
-                prob = float(p.get("probability"))
+                prob = float(item.get("probability", 0.0) or 0.0)
             except Exception:
                 continue
-            if did in allowed:
-                prob = max(0.0, min(1.0, prob))
-                if prob >= MIN_PROBA:
-                    preds.append({"label": did, "proba": prob})
+            if prob < LABEL_MIN_PROB:
+                continue
 
-    preds.sort(key=lambda x: x["proba"], reverse=True)
+            evidence = str(item.get("evidence", "") or "").strip()
+            # evidence must be a quote from chunk; require substring match
+            if not evidence or evidence.lower() not in t.lower():
+                continue
 
-    # If model says very low relevance, we still keep preds if present (to enable highlight debugging)
-    rel = max(0.0, min(1.0, rel))
-    if rel < AOAI_REL_THRESHOLD and not preds:
-        return rel, []
+            crit = item.get("criteriaMatched", [])
+            if not isinstance(crit, list):
+                crit = []
+            crit = [str(c).strip() for c in crit if str(c).strip()]
+            if not crit:
+                continue
 
-    # Relevance should not be lower than top prediction if there is one
-    if preds:
-        rel = max(rel, float(preds[0]["proba"]))
+            labels.append(
+                {
+                    "id": did,
+                    "probability": max(0.0, min(1.0, prob)),
+                    "evidence": evidence,
+                    "criteriaMatched": crit[:3],
+                }
+            )
 
-    return rel, preds
+    labels.sort(key=lambda x: x["probability"], reverse=True)
+    labels = labels[: min(len(labels), MAX_LABELS_PER_CHUNK)]
+
+    if not labels:
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "no_labels_after_validation"}
+
+    # Relevance should not be below top prob
+    rel = max(float(rel), float(labels[0]["probability"]))
+    return {"isRequirement": True, "relevance": float(rel), "labels": labels, "notes": "ok"}
 
 
-def _predict(text: str, top_k: int) -> Tuple[float, List[Dict[str, Any]]]:
+def _predict(chunk_text: str, top_k: int) -> Dict[str, Any]:
     if USE_MOCK:
-        return _mock_predict(text, top_k)
-    return _aoai_predict(text, top_k)
+        return _mock_predict(chunk_text, top_k)
+    return _aoai_predict(chunk_text, top_k)
 
 
 # -------------------------
@@ -264,7 +382,10 @@ def init():
     DEMANDS = _load_demands_xlsx()
     _build_demand_tokens()
 
-    logger.info("init(): USE_MOCK=%s demands=%d", USE_MOCK, len(DEMANDS))
+    logger.info(
+        "init(): USE_MOCK=%s demands=%d LABEL_MIN_PROB=%.2f HIGHLIGHT_MIN_PROB=%.2f RELEVANCE_MIN=%.2f",
+        USE_MOCK, len(DEMANDS), LABEL_MIN_PROB, HIGHLIGHT_MIN_PROB, RELEVANCE_MIN
+    )
 
     if not USE_MOCK:
         if AzureOpenAI is None:
@@ -294,14 +415,14 @@ def init():
 
 def run(raw_data):
     """
-    Contract (must not crash app):
+    Contract (do not break):
       { "predictions": <document> }
     document MUST include:
       documentDemandPredictions: ["id1","id2", ...]  (ARRAY OF STRINGS)
-    and per chunk:
+    per chunk:
       relevantProba: float
       cdTransformerPredictions: [{label, proba}]
-      cdLogregPredictions: SAME SHAPE (mirror)  <-- critical for your UI
+      cdLogregPredictions: SAME SHAPE (mirror)
     """
     try:
         req = _json_load_maybe(raw_data)
@@ -315,8 +436,9 @@ def run(raw_data):
         if not isinstance(document, dict):
             return {"error": "Bad request: 'document' must be JSON object", "predictions": {"documentDemandPredictions": []}}
 
-        num_preds = int(req.get("num_preds", 3))
+        num_preds = int(req.get("num_preds", MAX_LABELS_PER_CHUNK))
         num_preds = max(1, min(10, num_preds))
+        num_preds = min(num_preds, MAX_LABELS_PER_CHUNK)  # enforce max 3
 
         by_id = _find_content_byid(document)
 
@@ -326,38 +448,87 @@ def run(raw_data):
         best_doc_probs: Dict[str, float] = {}
         debug_left = MAX_DEBUG_CHUNKS
 
+        highlighted_chunks = 0
+
         for cid, content in by_id.items():
             if not isinstance(content, dict):
                 continue
 
             text = content.get("text", "")
+            t = (str(text) if text is not None else "").strip()
+
             if debug_left > 0:
-                logger.info("chunk=%s text_sample=%r", cid, (str(text)[:180] if text is not None else None))
+                logger.info("chunk=%s text_sample=%r", cid, t[:200])
                 debug_left -= 1
 
-            rel, preds = _predict(text, top_k=num_preds)
+            # Default fields (avoid nulls in UI)
+            content["relevantProba"] = 0.0
+            content["cdTransformerPredictions"] = []
+            content["cdLogregPredictions"] = []
 
-            # Always set expected keys/types
-            content["relevantProba"] = float(rel)
-            content["cdTransformerPredictions"] = preds if isinstance(preds, list) else []
-            # CRITICAL: mirror to logreg for UI selection logic
-            content["cdLogregPredictions"] = list(content["cdTransformerPredictions"])
+            pred = _predict(t, top_k=num_preds)
 
-            for p in content["cdTransformerPredictions"]:
-                try:
-                    did = str(p.get("label"))
-                    prob = float(p.get("proba", 0.0))
-                except Exception:
+            is_req = bool(pred.get("isRequirement", False))
+            try:
+                rel = float(pred.get("relevance", 0.0) or 0.0)
+            except Exception:
+                rel = 0.0
+
+            labels = pred.get("labels", []) or []
+            if not isinstance(labels, list):
+                labels = []
+
+            # Convert labels -> UI prediction shape
+            chunk_preds: List[Dict[str, Any]] = []
+            for item in labels[:num_preds]:
+                if not isinstance(item, dict):
                     continue
-                if did and (did not in best_doc_probs or prob > best_doc_probs[did]):
-                    best_doc_probs[did] = prob
+                did = str(item.get("id", "")).strip()
+                try:
+                    p = float(item.get("probability", 0.0) or 0.0)
+                except Exception:
+                    p = 0.0
+                if not did or p < LABEL_MIN_PROB:
+                    continue
+                chunk_preds.append({"label": did, "proba": p})
 
-        # Document-level: ARRAY OF STRINGS (IDs only), sorted by confidence
+            chunk_preds.sort(key=lambda x: x["proba"], reverse=True)
+            chunk_preds = chunk_preds[:num_preds]
+
+            top1 = float(chunk_preds[0]["proba"]) if chunk_preds else 0.0
+
+            # HIGHLIGHT RULE (as requested):
+            # isRequirement=True AND (prob_top1 >= 0.80)
+            should_highlight = bool(is_req and top1 >= HIGHLIGHT_MIN_PROB)
+
+            if should_highlight:
+                highlighted_chunks += 1
+                content["relevantProba"] = float(max(rel, top1))
+                content["cdTransformerPredictions"] = chunk_preds
+                content["cdLogregPredictions"] = list(chunk_preds)  # mirror for UI
+
+                # Document-level ids from highlighted chunks only
+                for p in chunk_preds:
+                    did = p["label"]
+                    prob = float(p["proba"])
+                    if did not in best_doc_probs or prob > best_doc_probs[did]:
+                        best_doc_probs[did] = prob
+            else:
+                # Keep empty predictions to reduce noise
+                content["relevantProba"] = 0.0
+                content["cdTransformerPredictions"] = []
+                content["cdLogregPredictions"] = []
+
+        # Document-level: ARRAY OF STRINGS (IDs), sorted by confidence
         ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True)]
         document["documentDemandPredictions"] = ids_sorted[:num_preds]
+
+        if MAX_DEBUG_CHUNKS > 0:
+            logger.info("highlighted_chunks=%d / total_chunks=%d doc_ids=%s", highlighted_chunks, len(by_id), document["documentDemandPredictions"])
 
         return {"predictions": document}
 
     except Exception as e:
         logger.exception("run() failed")
         return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
+
