@@ -1,278 +1,367 @@
+# score.py
 import json
-import os
-import re
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Globals (Azure ML calls init() once)
+DEMANDS: List[Dict[str, str]] = []
 CLIENT = None
 
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+# ----------------------------
+# Demands loading (local рядом score.py)
+# ----------------------------
+def _normalize_demands(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for r in rows:
+        did = r.get("id") or r.get("demand_id") or r.get("demandId")
+        demand = r.get("demand") or r.get("name") or r.get("label")
+        desc = r.get("description") or r.get("demand_description") or r.get("clarification") or ""
 
-# IMPORTANT: your env name
-AZURE_OPENAI_DEPLOYMENT = (
-    os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
-    or os.getenv("AZURE_OPENAI_DEPLOYMENT")
-)
+        if did is None:
+            continue
 
-DEMANDS_CONTEXT = ""
-MIN_DEMAND_PROB = float(os.getenv("MIN_DEMAND_PROB", "0.30"))
-MAX_RETURN_IDS = int(os.getenv("MAX_RETURN_IDS", "50"))
-
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _safe_response(ids: Optional[List[str]] = None) -> Dict[str, Any]:
-    # This is the known-good contract:
-    return {"predictions": {"documentDemandPredictions": ids or []}}
+        out.append(
+            {
+                "id": str(did).strip(),
+                "demand": ("" if demand is None else str(demand).strip()),
+                "description": ("" if desc is None else str(desc).strip()),
+            }
+        )
+    return out
 
 
-def _coerce_request(raw_data: Any) -> Dict[str, Any]:
+def _load_demands_from_xlsx(path: Path) -> List[Dict[str, str]]:
     try:
-        if raw_data is None:
-            return {}
-        if isinstance(raw_data, (bytes, bytearray)):
-            raw_data = raw_data.decode("utf-8", errors="ignore")
-        if isinstance(raw_data, str):
-            raw_data = raw_data.strip()
-            if not raw_data:
-                return {}
-            return json.loads(raw_data)
-        if isinstance(raw_data, dict):
-            return raw_data
-        return json.loads(str(raw_data))
-    except Exception:
-        return {}
-
-
-def _safe_json_extract(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    if not text:
-        return {}
-    if text.startswith("```"):
-        text = text.strip("`").strip()
-        parts = text.splitlines()
-        if parts and re.match(r"^[a-zA-Z]+$", parts[0].strip()):
-            text = "\n".join(parts[1:]).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        m = _JSON_OBJ_RE.search(text)
-        if not m:
-            return {}
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return {}
-
-
-def _here() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _try_load_demands_xlsx() -> str:
-    """
-    Optional. If it fails, we still run and return empty predictions.
-    XLSX columns (case-insensitive): demand_id/id, demand, description
-    """
-    try:
-        path = os.getenv("DEMANDS_PATH", "").strip()
-        if path:
-            if not os.path.isabs(path):
-                path = os.path.join(_here(), path)
-        else:
-            path = os.path.join(_here(), "demands.xlsx")
-
-        if not os.path.exists(path):
-            logger.warning("demands.xlsx not found at %s (continuing without demands context).", path)
-            return ""
-
-        from openpyxl import load_workbook  # type: ignore
-        wb = load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-
-        rows = list(ws.iter_rows(values_only=True))
-        if len(rows) < 2:
-            logger.warning("demands.xlsx has no data rows (continuing without demands context).")
-            return ""
-
-        headers = [str(h).strip().lower() for h in rows[0]]
-
-        def idx(*names):
-            for n in names:
-                if n in headers:
-                    return headers.index(n)
-            return None
-
-        i_id = idx("demand_id", "id")
-        i_name = idx("demand")
-        i_desc = idx("description")
-        if i_id is None or i_name is None or i_desc is None:
-            logger.warning("demands.xlsx missing required columns. headers=%s", headers)
-            return ""
-
-        lines = []
-        for r in rows[1:]:
-            did = str((r[i_id] if i_id < len(r) else "") or "").strip()
-            name = str((r[i_name] if i_name < len(r) else "") or "").strip()
-            desc = str((r[i_desc] if i_desc < len(r) else "") or "").strip()
-            if not did:
-                continue
-            if len(desc) > 450:
-                desc = desc[:450] + "…"
-            lines.append(f"- id: {did}\n  name: {name}\n  description: {desc}")
-
-        ctx = "\n".join(lines)
-        logger.info("Loaded demands context count=%d from %s", len(lines), path)
-        return ctx
-
+        import pandas as pd
     except Exception as e:
-        logger.warning("Failed to load demands.xlsx: %s (continuing without demands context).", str(e))
-        return ""
+        raise RuntimeError("pandas is required to load demands.xlsx") from e
+
+    df = pd.read_excel(path)
+    df = df.fillna("")
+    rows = df.to_dict(orient="records")
+    return _normalize_demands(rows)
 
 
+def _load_demands_from_csv(path: Path) -> List[Dict[str, str]]:
+    try:
+        import pandas as pd
+    except Exception as e:
+        raise RuntimeError("pandas is required to load demands.csv") from e
+
+    df = pd.read_csv(path)
+    df = df.fillna("")
+    rows = df.to_dict(orient="records")
+    return _normalize_demands(rows)
+
+
+def _load_demands_from_json(path: Path) -> List[Dict[str, str]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "demands" in data and isinstance(data["demands"], list):
+        rows = data["demands"]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = []
+    return _normalize_demands(rows)
+
+
+def _load_demands_table() -> List[Dict[str, str]]:
+    here = Path(__file__).resolve().parent
+
+    dem_path = os.getenv("DEMANDS_PATH")
+    candidates: List[Path] = []
+    if dem_path:
+        candidates.append(Path(dem_path))
+
+    candidates.extend(
+        [
+            here / "demands.xlsx",
+            here / "demands.csv",
+            here / "demands.json",
+        ]
+    )
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            if p.suffix.lower() == ".xlsx":
+                dem = _load_demands_from_xlsx(p)
+            elif p.suffix.lower() == ".csv":
+                dem = _load_demands_from_csv(p)
+            elif p.suffix.lower() == ".json":
+                dem = _load_demands_from_json(p)
+            else:
+                continue
+
+            if dem:
+                logger.info(f"Loaded demands from: {p} (count={len(dem)})")
+                return dem
+
+    raise RuntimeError(
+        f"Could not find demands file. Put demands.xlsx/csv/json next to score.py "
+        f"or set DEMANDS_PATH. Looked in: {here}"
+    )
+
+
+def _build_demands_context(demands: List[Dict[str, str]]) -> str:
+    lines = []
+    for d in demands:
+        did = d["id"]
+        name = d.get("demand", "")
+        desc = d.get("description", "")
+        lines.append(f"- id: {did}\n  name: {name}\n  description: {desc}")
+    return "\n".join(lines)
+
+
+# ----------------------------
+# Azure OpenAI client
+# ----------------------------
 def _init_openai_client():
     try:
-        from openai import AzureOpenAI  # type: ignore
-        if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
-            logger.warning("Azure OpenAI env missing (endpoint/key/deployment).")
-            return None
-        return AzureOpenAI(
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-        )
+        from openai import AzureOpenAI
     except Exception as e:
-        logger.warning("OpenAI client init failed: %s", str(e))
-        return None
+        raise RuntimeError("Python package 'openai' is required in the environment.") from e
+
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+
+    if not endpoint or not api_key:
+        raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY")
+
+    return AzureOpenAI(azure_endpoint=endpoint, api_key=api_key, api_version=api_version)
 
 
 def init():
-    """
-    Must not crash the container.
-    """
-    global CLIENT, DEMANDS_CONTEXT
+    global DEMANDS, CLIENT
+    logger.info("Initializing OpenAI-based scoring...")
+    DEMANDS = _load_demands_table()
+    if not DEMANDS:
+        raise RuntimeError("Demands table is empty after loading.")
     CLIENT = _init_openai_client()
-    DEMANDS_CONTEXT = _try_load_demands_xlsx()
-    logger.info("init complete. client=%s deployment=%s", "ok" if CLIENT else "none", AZURE_OPENAI_DEPLOYMENT)
+
+    # IMPORTANT: your env uses AZURE_OPENAI_CHAT_DEPLOYMENT
+    if not (os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT")):
+        raise RuntimeError("Missing AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT).")
+
+    logger.info("Initialization finished successfully.")
 
 
-def _classify_text_to_ids(text: str, num_preds: int) -> List[str]:
-    """
-    Minimal, safe classification. Never raises.
-    Returns demandIds list (strings).
-    """
-    if CLIENT is None or not AZURE_OPENAI_DEPLOYMENT:
+# ----------------------------
+# Contract helpers: request/response must remain 1:1
+# ----------------------------
+def _parse_request(raw_data: Any) -> Tuple[Dict[str, Any], int]:
+    if raw_data is None:
+        raise ValueError("Bad Request: body is empty")
+
+    if isinstance(raw_data, (bytes, bytearray)):
+        raw_data = raw_data.decode("utf-8")
+
+    if isinstance(raw_data, str):
+        raw_data = raw_data.strip()
+        if not raw_data:
+            raise ValueError("Bad Request: body is empty")
+        req = json.loads(raw_data)
+    elif isinstance(raw_data, dict):
+        req = raw_data
+    else:
+        raise ValueError(f"Bad Request: unsupported body type: {type(raw_data)}")
+
+    if "document" not in req or "num_preds" not in req:
+        raise ValueError("Bad Request: expected fields 'document' and 'num_preds'.")
+
+    document = req["document"]
+    if not isinstance(document, dict):
+        raise ValueError("Bad Request: 'document' must be a JSON object.")
+
+    try:
+        num_preds = int(req["num_preds"])
+    except Exception:
+        num_preds = 3
+    num_preds = max(1, min(10, num_preds))
+    return document, num_preds
+
+
+def _iter_chunks(document: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    cd = document.get("contentDomain") or {}
+    by_id = cd.get("byId") or {}
+    if not isinstance(by_id, dict):
         return []
+    chunks: List[Tuple[str, Dict[str, Any]]] = []
+    for cid, obj in by_id.items():
+        if isinstance(obj, dict):
+            chunks.append((str(cid), obj))
+    return chunks
 
-    # If demands aren't loaded, don't hallucinate ids
-    if not DEMANDS_CONTEXT.strip():
-        return []
 
-    sys_msg = "Return ONLY valid JSON. Never invent IDs."
-    user_msg = f"""
-Use ONLY demand IDs from the list below. If nothing fits, return empty demandIds.
+# ----------------------------
+# LLM prompt (fixed: includes chunkId + relevance + strict ID rule)
+# ----------------------------
+def _prompt_for_chunk(demands_context: str, chunk_id: str, chunk_text: str, num_preds: int) -> str:
+    return f"""
+You are an assistant for bid engineers. You must detect whether the text chunk contains a concrete customer requirement/specification (highlight-worthy) and map it to predefined demands.
 
-Demands:
-{DEMANDS_CONTEXT}
+**Rules & Constraints:**
+- Use ONLY the demand IDs provided in the Demands list. Never invent IDs.
+- The demand **Name** hints WHAT this is about.
+- The **Description** tells WHEN to match.
+- First decide relevance (is this a requirement/spec).
+- If NOT relevant: set relevantProbability < 0.30 and return empty demandIds.
+- If relevant: return up to {num_preds} demandIds with probabilities.
+- Probability scale for demandIds:
+  - 1.0: direct explicit match
+  - 0.7-0.9: strong semantic relationship
+  - 0.5-0.7: moderate
+  - 0.3-0.5: weak
+  - below 0.3: exclude
 
-Text:
-{text}
+**Demands:**
+{demands_context}
 
-Return JSON ONLY:
+**Text Chunk to analyze:**
+chunkId: {chunk_id}
+text: {chunk_text}
+
+Respond with valid JSON EXACTLY:
 {{
-  "demandIds": [{{"id":"<one_of_the_listed_ids>","probability":0.85}}]
+  "chunkId": "{chunk_id}",
+  "relevantProbability": 0.0,
+  "demandIds": [{{"id":"<id_from_demands_list>","probability":0.85}}],
+  "explanation": "brief explanation"
 }}
 """.strip()
 
-    try:
-        resp = CLIENT.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.0,
-            max_tokens=500,
-        )
-        obj = _safe_json_extract(resp.choices[0].message.content or "")
-        demand_ids = obj.get("demandIds") or []
-        out: List[str] = []
-        if isinstance(demand_ids, list):
-            for d in demand_ids:
-                if not isinstance(d, dict):
-                    continue
-                did = str(d.get("id") or "").strip()
-                if not did:
-                    continue
-                try:
-                    p = float(d.get("probability") or 0.0)
-                except Exception:
-                    p = 0.0
-                if p >= MIN_DEMAND_PROB:
-                    out.append(did)
 
-        # cap
-        out = out[: max(1, min(int(num_preds or 3), 10))]
-        return out
+def _call_openai_for_chunk(chunk_id: str, chunk_text: str, demands_context: str, num_preds: int) -> Dict[str, Any]:
+    deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    if not deployment:
+        return {"chunkId": chunk_id, "relevantProbability": 0.0, "demandIds": [], "explanation": "missing deployment env"}
+
+    assert CLIENT is not None
+
+    prompt = _prompt_for_chunk(demands_context, chunk_id, chunk_text, num_preds)
+
+    resp = CLIENT.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": "Return ONLY valid JSON. No markdown."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+
+    # Parse safely
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
-        return []
+        pass
+
+    return {"chunkId": chunk_id, "relevantProbability": 0.0, "demandIds": [], "explanation": "model returned non-JSON or invalid JSON"}
+
+
+# ----------------------------
+# Core inference: KEEP OUTPUT/INPUT NAMES 1:1
+# ----------------------------
+def inference(document: Dict[str, Any], num_preds: int) -> Dict[str, Any]:
+    start = time.time()
+
+    chunks = _iter_chunks(document)
+    if not chunks:
+        document["documentDemandPredictions"] = []
+        return document
+
+    demands_context = _build_demands_context(DEMANDS)
+
+    global_ids = set()
+
+    for cid, content in chunks:
+        chunk_text = str(content.get("text") or "")
+        if len(chunk_text.split()) <= 2:
+            content.update(
+                {
+                    "relevantProba": 0.0,
+                    "cdLogregPredictions": [],
+                    "cdTransformerPredictions": [],
+                }
+            )
+            continue
+
+        llm = _call_openai_for_chunk(cid, chunk_text, demands_context, num_preds)
+
+        # relevance from model (fallback to 0)
+        try:
+            rel = float(llm.get("relevantProbability", 0.0) or 0.0)
+        except Exception:
+            rel = 0.0
+
+        demand_ids = llm.get("demandIds", [])
+        if not isinstance(demand_ids, list):
+            demand_ids = []
+
+        cd_transformer_predictions: List[Dict[str, Any]] = []
+        for x in demand_ids:
+            if not isinstance(x, dict):
+                continue
+            did = x.get("id")
+            proba = x.get("probability")
+            if did is None:
+                continue
+            try:
+                p = float(proba)
+            except Exception:
+                p = 0.0
+            if p < 0.3:
+                continue
+            cd_transformer_predictions.append({"label": str(did), "proba": p})
+
+        cd_transformer_predictions = cd_transformer_predictions[:num_preds]
+
+        top_label_proba = cd_transformer_predictions[0]["proba"] if cd_transformer_predictions else 0.0
+
+        # IMPORTANT:
+        # relevantProba drives highlighting in old flow. Use max(rel, top_label_proba)
+        # so highlight can trigger if model provided label confidence but low rel field.
+        relevant_proba = float(max(rel, top_label_proba))
+
+        # Mirror old logreg/transformer shapes
+        cd_logreg_predictions = list(cd_transformer_predictions)
+
+        # Global IDs:
+        # Do not block everything with 0.7 initially. Use 0.3 (same as your filter).
+        for pred in cd_transformer_predictions:
+            if float(pred.get("proba", 0.0)) >= 0.3:
+                global_ids.add(pred["label"])
+
+        content.update(
+            {
+                "relevantProba": relevant_proba,
+                "cdLogregPredictions": cd_logreg_predictions,
+                "cdTransformerPredictions": cd_transformer_predictions,
+            }
+        )
+
+    # CRITICAL: ARRAY OF STRINGS
+    document["documentDemandPredictions"] = sorted(list(global_ids))
+
+    logger.info(f"Time to format results: {time.time() - start}")
+    return document
 
 
 def run(raw_data):
-    """
-    Must NEVER throw.
-    Must return the known-good minimal contract.
-    """
     try:
-        req = _coerce_request(raw_data)
-        if not isinstance(req, dict):
-            return _safe_response([])
+        document, num_pred = _parse_request(raw_data)
+        result_doc = inference(document, num_pred)
+        return {"predictions": result_doc}
 
-        document = req.get("document")
-        num_preds = int(req.get("num_preds", 3))
-
-        # document may arrive as string
-        if isinstance(document, str):
-            try:
-                document = json.loads(document)
-            except Exception:
-                document = None
-
-        if not isinstance(document, dict):
-            return _safe_response([])
-
-        # Extract chunks if present; if not, still safe
-        cd = document.get("contentDomain") or {}
-        by_id = cd.get("byId") or {}
-        if not isinstance(by_id, dict) or not by_id:
-            return _safe_response([])
-
-        seen = set()
-        global_ids: List[str] = []
-
-        # Keep it light and safe: pick ids across chunks
-        for _, content in by_id.items():
-            if not isinstance(content, dict):
-                continue
-            text = str(content.get("text") or "").strip()
-            if len(text) < 10:
-                continue
-            ids = _classify_text_to_ids(text, num_preds)
-            for did in ids:
-                if did not in seen:
-                    seen.add(did)
-                    global_ids.append(did)
-                if len(global_ids) >= MAX_RETURN_IDS:
-                    break
-            if len(global_ids) >= MAX_RETURN_IDS:
-                break
-
-        return _safe_response(global_ids)
-
-    except Exception:
-        return _safe_response([])
+    except Exception as e:
+        logger.error(f"Scoring failed: {str(e)}", exc_info=True)
+        return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
