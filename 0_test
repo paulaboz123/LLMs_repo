@@ -2,7 +2,7 @@ import os
 import json
 import time
 import logging
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from openai import AzureOpenAI
@@ -10,342 +10,124 @@ from openai import AzureOpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-aoai_client: Optional[AzureOpenAI] = None
-aoai_deployment: Optional[str] = None
+# Azure OpenAI client
+_client: Optional[AzureOpenAI] = None
+_deployment: Optional[str] = None
 
-demands: List[Dict[str, str]] = []  # {"id":..., "name":..., "description":...}
+# Demands (loaded from local file next to score.py)
+_demands: List[Dict[str, str]] = []  # {"id":..., "name":..., "description":...}
 
 
+# ----------------------------
+# Utilities (hardening)
+# ----------------------------
 def _this_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _ensure_list_of_strings(x: Any) -> List[str]:
+    """
+    CRITICAL: application expects JSON array of strings.
+    If x is list of dicts -> extract "id".
+    If x is a single string -> wrap into [string].
+    Otherwise -> [].
+    """
+    if x is None:
+        return []
+    if isinstance(x, str):
+        s = x.strip()
+        return [s] if s else []
+    if isinstance(x, list):
+        out: List[str] = []
+        for item in x:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    out.append(s)
+            elif isinstance(item, dict):
+                # if someone mistakenly returns [{"id": "...", "probability": ...}]
+                s = str(item.get("id", "")).strip()
+                if s:
+                    out.append(s)
+        return out
+    # sets, tuples, etc.
+    try:
+        return [str(v).strip() for v in list(x) if str(v).strip()]
+    except Exception:
+        return []
+
+
+def _safe_json_loads(s: str) -> Optional[Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
 def _find_demands_file() -> str:
-    # Demands obok score.py / .env (tak jak wymagasz)
     base = _this_dir()
-    candidates = [
-        os.path.join(base, "demands.xlsx"),
-        os.path.join(base, "demands.csv"),
-        os.path.join(base, "demands.json"),
-    ]
-    for p in candidates:
+    # Demands obok score.py (jak u Ciebie)
+    for name in ["demands.xlsx", "demands.csv", "demands.json"]:
+        p = os.path.join(base, name)
         if os.path.isfile(p):
             return p
-    raise FileNotFoundError(
-        "Demands file not found next to score.py. Expected demands.xlsx OR demands.csv OR demands.json"
-    )
+    raise FileNotFoundError("Missing demands file next to score.py (demands.xlsx/csv/json).")
 
 
-def _normalize_demands_from_df(df: pd.DataFrame) -> List[Dict[str, str]]:
-    required = {"demand_id", "demand", "demand_description"}
-    cols = set([c.strip() for c in df.columns])
-    missing = required - cols
+def _load_demands() -> List[Dict[str, str]]:
+    """
+    Your Excel: demand_id, demand, demand_description
+    We use demand_description for context, but output always uses demand_id.
+    """
+    path = _find_demands_file()
+    logger.info(f"Loading demands from: {path}")
+
+    if path.endswith(".xlsx"):
+        df = pd.read_excel(path)
+    elif path.endswith(".csv"):
+        df = pd.read_csv(path)
+    elif path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "demands" in data:
+            data = data["demands"]
+        out = []
+        for d in data if isinstance(data, list) else []:
+            if not isinstance(d, dict):
+                continue
+            did = str(d.get("demand_id") or d.get("id") or "").strip()
+            name = str(d.get("demand") or d.get("name") or "").strip()
+            desc = str(d.get("demand_description") or d.get("description") or d.get("clarification") or "").strip()
+            if did:
+                out.append({"id": did, "name": name, "description": desc})
+        return out
+    else:
+        raise ValueError("Unsupported demands file type.")
+
+    # Normalize DF
+    cols = {c.strip() for c in df.columns}
+    req = {"demand_id", "demand", "demand_description"}
+    missing = req - cols
     if missing:
-        raise ValueError(f"Demands file missing required columns: {sorted(missing)}. Found: {sorted(cols)}")
+        raise ValueError(f"Demands missing columns: {sorted(missing)}")
 
     out: List[Dict[str, str]] = []
     for _, row in df.iterrows():
         did = str(row["demand_id"]).strip()
         name = str(row["demand"]).strip()
         desc = str(row["demand_description"]).strip()
-        if not did:
-            continue
-        out.append({"id": did, "name": name, "description": desc})
+        if did:
+            out.append({"id": did, "name": name, "description": desc})
     return out
 
 
-def _load_demands() -> List[Dict[str, str]]:
-    path = _find_demands_file()
-    logger.info(f"Loading demands from: {path}")
-
-    if path.endswith(".xlsx"):
-        return _normalize_demands_from_df(pd.read_excel(path))
-
-    if path.endswith(".csv"):
-        return _normalize_demands_from_df(pd.read_csv(path))
-
-    if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "demands" in data:
-            data = data["demands"]
-        if not isinstance(data, list):
-            raise ValueError("demands.json must be a list or {\"demands\":[...]}")
-        out = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            did = str(item.get("demand_id") or item.get("id") or "").strip()
-            name = str(item.get("demand") or item.get("name") or "").strip()
-            desc = str(item.get("demand_description") or item.get("description") or item.get("clarification") or "").strip()
-            if did:
-                out.append({"id": did, "name": name, "description": desc})
-        return out
-
-    raise ValueError(f"Unsupported demands file type: {path}")
-
-
-def _build_demands_context(demands_list: List[Dict[str, str]]) -> str:
-    lines = []
-    for d in demands_list:
-        lines.append(f"- ID: {d['id']}\n  Name: {d['name']}\n  Clarification: {d['description']}")
-    return "\n".join(lines)
-
-
-def _build_chunks_text(chunks: List[Tuple[str, str]]) -> str:
-    out = []
-    for cid, txt in chunks:
-        txt = (txt or "").replace("\n", " ").strip()
-        out.append(f'ChunkId: "{cid}"\nText: "{txt}"\n')
-    return "\n".join(out)
-
-
-def _prompt_template(demands_context: str, chunks_text: str) -> str:
-    return f"""
-**Rules & Constraints:**
-- The demand **Name** tells you WHAT equipment this applies to
-- The **Clarification** tells you WHEN to match (specific requirement criteria)
-- Match ONLY when the chunk content aligns with the demand's **Clarification**
-- Use ONLY predefined demands (by ID) from the list below
-- Maximum three demands per chunk
-- If no relevant demands, return empty demandIds array
-
-**Scoring Guidelines:**
-Return probability 0.0-1.0.
-Below 0.3 is not relevant (exclude).
-
-**Demands:**
-{demands_context}
-
-**Text Chunks to analyze:**
-{chunks_text}
-
-Respond with valid JSON only:
-{{
-  "results": [
-    {{
-      "chunkId": "chunk_id",
-      "demandIds": [{{"id": "demand_id", "probability": 0.85}}],
-      "explanation": "Brief explanation"
-    }}
-  ]
-}}
-""".strip()
-
-
-def _call_aoai(prompt: str) -> Dict[str, Any]:
-    assert aoai_client is not None and aoai_deployment is not None
-
-    resp = aoai_client.chat.completions.create(
-        model=aoai_deployment,
-        messages=[
-            {"role": "system", "content": "Output ONLY valid JSON. No prose."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.0,
-        max_tokens=2000,
-    )
-    content = (resp.choices[0].message.content or "").strip()
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        # salvage first JSON object
-        s = content.find("{")
-        e = content.rfind("}")
-        if s >= 0 and e > s:
-            return json.loads(content[s:e+1])
-        raise
-
-
-def is_relevant_customer_demand(
-    text: str,
-    relevant_proba: float,
-    cd_logreg_proba: float,
-    cd_transformer_proba: float,
-) -> bool:
-    return (
-        len((text or "").split(" ")) > 2
-        and cd_logreg_proba > 0.1
-        and ((relevant_proba > 0.65 and cd_transformer_proba > 0.9) or (cd_transformer_proba > 0.95))
+def _demands_context(demands: List[Dict[str, str]]) -> str:
+    # Keep compact; description is key for match
+    return "\n".join(
+        f"- ID: {d['id']}\n  Name: {d['name']}\n  Clarification: {d['description']}"
+        for d in demands
     )
 
 
-def init():
-    global aoai_client, aoai_deployment, demands
-
-    logger.info("Initializing...")
-
-    demands = _load_demands()
-    if not demands:
-        raise RuntimeError("Demands list is empty.")
-    logger.info(f"Loaded demands: {len(demands)}")
-
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
-    aoai_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
-
-    missing = [k for k, v in {
-        "AZURE_OPENAI_ENDPOINT": endpoint,
-        "AZURE_OPENAI_API_KEY": api_key,
-        "AZURE_OPENAI_API_VERSION": api_version,
-        "AZURE_OPENAI_DEPLOYMENT": aoai_deployment,
-    }.items() if not v]
-    if missing:
-        raise RuntimeError(f"Missing required env vars: {missing}")
-
-    aoai_client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
-    logger.info("Initialization completed.")
-
-
-def inference(document: Dict[str, Any], num_cd_predictions: int) -> Dict[str, Any]:
-    t0 = time.time()
-
-    if not isinstance(document, dict):
-        raise ValueError("document must be a JSON object")
-
-    by_id = document.get("contentDomain", {}).get("byId", {})
-    if not isinstance(by_id, dict):
-        raise ValueError("document.contentDomain.byId must be an object")
-
-    # stable list of chunks
-    contents: List[Dict[str, Any]] = list(by_id.values())
-    chunks: List[Tuple[str, str]] = []
-    content_by_id: Dict[str, Dict[str, Any]] = {}
-
-    for c in contents:
-        if not isinstance(c, dict):
-            continue
-        cid = str(c.get("id", "")).strip()
-        txt = str(c.get("text", "") or "")
-        if cid:
-            chunks.append((cid, txt))
-            content_by_id[cid] = c
-
-    if not chunks:
-        document["documentDemandPredictions"] = []  # MUST be array of strings
-        return document
-
-    demands_context = _build_demands_context(demands)
-    max_chunks_per_call = int(os.getenv("MAX_CHUNKS_PER_CALL", "25"))
-
-    # IMPORTANT: global predictions MUST be list of strings (IDs only)
-    document_demand_ids: set[str] = set()
-
-    for i in range(0, len(chunks), max_chunks_per_call):
-        batch = chunks[i:i+max_chunks_per_call]
-        prompt = _prompt_template(demands_context, _build_chunks_text(batch))
-        llm_json = _call_aoai(prompt)
-
-        results = llm_json.get("results", [])
-        if not isinstance(results, list):
-            raise ValueError("LLM response missing 'results' array")
-
-        res_by_chunk: Dict[str, Dict[str, Any]] = {}
-        for r in results:
-            if isinstance(r, dict) and "chunkId" in r:
-                res_by_chunk[str(r["chunkId"])] = r
-
-        for cid, txt in batch:
-            content_obj = content_by_id.get(cid)
-            if content_obj is None:
-                continue
-
-            r = res_by_chunk.get(cid, {})
-            demand_ids = r.get("demandIds", [])
-            if not isinstance(demand_ids, list):
-                demand_ids = []
-
-            # normalize -> list of {"label": <demand_id>, "proba": <float>}
-            normalized: List[Dict[str, Any]] = []
-            for di in demand_ids:
-                if not isinstance(di, dict):
-                    continue
-                did = str(di.get("id", "")).strip()
-                try:
-                    prob = float(di.get("probability", 0.0))
-                except Exception:
-                    prob = 0.0
-                if not did:
-                    continue
-                if prob < 0.3:
-                    continue
-                normalized.append({"label": did, "proba": max(0.0, min(1.0, prob))})
-
-            normalized.sort(key=lambda x: x["proba"], reverse=True)
-            top = normalized[: max(1, int(num_cd_predictions))]
-
-            # emulate legacy
-            cd_transformer_predictions = top
-            cd_logreg_predictions = [{"label": p["label"], "proba": max(0.0, min(1.0, p["proba"] * 0.85))} for p in top]
-            relevant_proba = float(top[0]["proba"]) if top else 0.0
-
-            # attach per-chunk fields (UI may rely on these)
-            content_obj["relevantProba"] = relevant_proba
-            content_obj["cdLogregPredictions"] = cd_logreg_predictions
-            content_obj["cdTransformerPredictions"] = cd_transformer_predictions
-
-            # legacy gating -> add ONLY ID string to global set
-            if top:
-                cd_logreg_top = float(cd_logreg_predictions[0]["proba"]) if cd_logreg_predictions else 0.0
-                cd_tr_top = float(cd_transformer_predictions[0]["proba"]) if cd_transformer_predictions else 0.0
-                if is_relevant_customer_demand(txt, relevant_proba, cd_logreg_top, cd_tr_top):
-                    document_demand_ids.add(str(cd_transformer_predictions[0]["label"]))
-
-    # CRITICAL FIX:
-    # documentDemandPredictions MUST be: ["id1","id2",...]
-    document["documentDemandPredictions"] = list(document_demand_ids)
-
-    logger.info(f"Time to score + format results: {time.time()-t0:.3f}s")
-    return document
-
-
-def run(raw_data):
-    try:
-        logger.info(f"Received request: {str(raw_data)[:2000]}")
-
-        if raw_data is None:
-            raise ValueError("Bad Request: Request body cannot be empty!")
-
-        if isinstance(raw_data, (bytes, bytearray)):
-            raw_data = raw_data.decode("utf-8", errors="ignore")
-
-        if isinstance(raw_data, str):
-            if raw_data.strip() == "":
-                raise ValueError("Bad Request: Request body cannot be empty!")
-            try:
-                request_data = json.loads(raw_data)
-            except json.JSONDecodeError:
-                raise ValueError("Bad Request: Invalid JSON format!")
-        elif isinstance(raw_data, dict):
-            request_data = raw_data
-        else:
-            raise ValueError("Bad Request: Unsupported request body type!")
-
-        if "document" not in request_data or "num_preds" not in request_data:
-            raise ValueError("Bad Request: expected 'document' and 'num_preds'")
-
-        document = request_data["document"]
-        num_pred = int(request_data["num_preds"])
-
-        if isinstance(document, str):
-            document = json.loads(document)
-
-        response = inference(document, num_pred)
-
-        # AML standard: return {"predictions": ...}
-        return {"predictions": response}
-
-    except ValueError as ve:
-        logger.warning(f"Bad request: {str(ve)}")
-        raise
-    except Exception as e:
-        logger.error(f"Error: {str(e)}", exc_info=True)
-        raise Exception("Internal server error")
-
+def _prompt(demands_ctx: str, chunk_id: str, c_
 
