@@ -31,10 +31,19 @@ MAX_SENTENCES_PER_CHUNK = int(os.getenv("MAX_SENTENCES_PER_CHUNK", "10"))
 MAX_SENTENCES_TO_LLM = int(os.getenv("MAX_SENTENCES_TO_LLM", "4"))
 
 USE_LLM = os.getenv("USE_LLM", "1").strip() == "1" and not USE_MOCK
-MAX_CANDIDATES_TO_LLM = int(os.getenv("MAX_CANDIDATES_TO_LLM", "6"))
+MAX_CANDIDATES_TO_LLM = int(os.getenv("MAX_CANDIDATES_TO_LLM", "10"))
 
+# Gate policy
 REQUIRE_MODAL_OR_STRUCTURE = os.getenv("REQUIRE_MODAL_OR_STRUCTURE", "1").strip() == "1"
 ALLOW_REQUIREMENTS_WITHOUT_MODAL = os.getenv("ALLOW_REQUIREMENTS_WITHOUT_MODAL", "0").strip() == "1"
+
+# Validation looseness
+CRITERIA_MIN_OVERLAP = int(os.getenv("CRITERIA_MIN_OVERLAP", "2"))
+DESC_MATCH_MIN_OVERLAP = int(os.getenv("DESC_MATCH_MIN_OVERLAP", "2"))
+
+# Retrieval fallback
+ALWAYS_RETURN_CANDIDATES = os.getenv("ALWAYS_RETURN_CANDIDATES", "1").strip() == "1"
+NGRAM_N = int(os.getenv("NGRAM_N", "3"))
 
 MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))
 
@@ -45,18 +54,18 @@ CHAT_DEPLOYMENT = None
 # Demands cache
 # -------------------------
 DEMANDS: List[Dict[str, str]] = []
-DEMAND_TEXT: Dict[str, str] = {}
 DEMAND_NAME: Dict[str, str] = {}
 DEMAND_DESC: Dict[str, str] = {}
+DEMAND_TEXT: Dict[str, str] = {}
 
 DEMAND_TOKS_ALL: Dict[str, set] = {}
 DEMAND_TOKS_DESC: Dict[str, set] = {}
 DEMAND_TOKS_NAME: Dict[str, set] = {}
+DEMAND_NGRAMS_ALL: Dict[str, set] = {}  # id -> char ngrams of (demand + description)
 
 # -------------------------
-# Stopwords (English ONLY)
-# NOTE: per your request, NO domain stopwords removed.
-# Also, we keep requirement-signal words (shall/must/required/requirement/need/require).
+# Stopwords (English ONLY), no domain stopwords per your request
+# Keep requirement signal words.
 # -------------------------
 STOPWORDS = {
     "the", "and", "or", "to", "of", "in", "on", "for", "with", "a", "an", "as", "at", "by",
@@ -68,7 +77,7 @@ STOPWORDS = {
 }
 
 # -------------------------
-# Requirement heuristics (EN only)
+# Requirement heuristics (EN)
 # -------------------------
 REQ_MODAL_RE = re.compile(
     r"\b(shall|must|required|requirement|should|need to|has to|may not|must not|shall not|prohibit|forbidden)\b",
@@ -81,12 +90,11 @@ REQ_STRUCT_RE = re.compile(
 REQ_NUM_RE = re.compile(r"\b\d+([.,]\d+)?\b")
 UNIT_RE = re.compile(r"\b(mm|cm|m|kg|w|kw|mw|v|kv|a|ma|hz|rpm|bar|pa|degc|°c|ip\d{2}\b)", re.IGNORECASE)
 
-# heading-ish heuristic
 HEADING_RE = re.compile(r"^\s*([A-Z0-9][A-Z0-9 \-/,:._]{3,}|[0-9]+(\.[0-9]+)+\s+.+)\s*$")
 
 
 # -------------------------
-# Utilities
+# Helpers
 # -------------------------
 def _json_load_maybe(x: Any) -> Any:
     if isinstance(x, (bytes, bytearray)):
@@ -148,9 +156,6 @@ def _load_demands_xlsx() -> List[Dict[str, str]]:
 
 
 def _tokenize(s: str) -> set:
-    """
-    English/ASCII tokenizer: a-z0-9 only, removes ONLY basic English stopwords.
-    """
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9]+", " ", s)
     toks = []
@@ -163,14 +168,46 @@ def _tokenize(s: str) -> set:
     return set(toks)
 
 
+def _normalize_for_ngrams(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _char_ngrams(s: str, n: int) -> set:
+    s = _normalize_for_ngrams(s)
+    if len(s) < n:
+        return {s} if s else set()
+    grams = set()
+    # include spaces (important for phrase-like matching)
+    for i in range(0, len(s) - n + 1):
+        grams.add(s[i : i + n])
+    return grams
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    union = len(a | b)
+    return float(inter) / float(union) if union else 0.0
+
+
 def _build_demand_indexes():
-    global DEMAND_TEXT, DEMAND_NAME, DEMAND_DESC, DEMAND_TOKS_ALL, DEMAND_TOKS_DESC, DEMAND_TOKS_NAME
-    DEMAND_TEXT = {}
+    global DEMAND_NAME, DEMAND_DESC, DEMAND_TEXT
+    global DEMAND_TOKS_ALL, DEMAND_TOKS_DESC, DEMAND_TOKS_NAME, DEMAND_NGRAMS_ALL
+
     DEMAND_NAME = {}
     DEMAND_DESC = {}
+    DEMAND_TEXT = {}
     DEMAND_TOKS_ALL = {}
     DEMAND_TOKS_DESC = {}
     DEMAND_TOKS_NAME = {}
+    DEMAND_NGRAMS_ALL = {}
 
     for d in DEMANDS:
         did = d["id"]
@@ -184,6 +221,10 @@ def _build_demand_indexes():
         DEMAND_TOKS_DESC[did] = _tokenize(desc)
         DEMAND_TOKS_ALL[did] = set(DEMAND_TOKS_NAME[did] | DEMAND_TOKS_DESC[did])
 
+        # ngrams on full text improve retrieval robustness when token overlap fails
+        full = (name + " " + desc).strip()
+        DEMAND_NGRAMS_ALL[did] = _char_ngrams(full, NGRAM_N)
+
         desc_short = desc if len(desc) <= 220 else (desc[:220] + "…")
         DEMAND_TEXT[did] = f"{name} | {desc_short}"
 
@@ -192,13 +233,11 @@ def _split_into_sentences_or_lines(chunk_text: str) -> List[str]:
     t = (chunk_text or "").strip()
     if not t:
         return []
-
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
     tableish = (len(lines) >= 6) or any(("|" in ln or "\t" in ln) for ln in lines)
     if tableish:
         out = [ln for ln in lines if len(ln) >= MIN_CHUNK_LEN]
         return out[:MAX_SENTENCES_PER_CHUNK]
-
     parts = re.split(r"(?<=[.!?])\s+|\n+", t)
     parts = [p.strip() for p in parts if p and p.strip()]
     return parts[:MAX_SENTENCES_PER_CHUNK]
@@ -218,9 +257,6 @@ def _is_heading_like(s: str) -> bool:
 
 
 def _is_requirement_fast(text: str) -> Tuple[bool, float]:
-    """
-    Conservative gate to avoid highlighting topic mentions.
-    """
     t = (text or "").strip()
     if len(t) < MIN_CHUNK_LEN:
         return False, 0.0
@@ -241,44 +277,116 @@ def _is_requirement_fast(text: str) -> Tuple[bool, float]:
     return False, 0.25
 
 
+# -------------------------
+# Retrieval (NEVER return empty when ALWAYS_RETURN_CANDIDATES=1)
+# -------------------------
 def _candidate_retrieval(sentence: str, k: int) -> List[str]:
-    """
-    Retrieval is permissive; no domain stopwords.
-    """
     stoks = _tokenize(sentence)
-    if not stoks:
+
+    scored_tok: List[Tuple[str, int]] = []
+    if stoks:
+        for did, dtoks in DEMAND_TOKS_ALL.items():
+            if not dtoks:
+                continue
+            overlap = len(stoks & dtoks)
+            if overlap > 0:
+                scored_tok.append((did, overlap))
+        scored_tok.sort(key=lambda x: x[1], reverse=True)
+
+    # Primary: token overlap
+    if scored_tok:
+        return [did for did, _ in scored_tok[: max(1, k)]]
+
+    # Fallback: char ngram similarity (robust to tokenization/OCR/form variations)
+    if ALWAYS_RETURN_CANDIDATES:
+        sgrams = _char_ngrams(sentence, NGRAM_N)
+        scored_ng: List[Tuple[str, float]] = []
+        for did, grams in DEMAND_NGRAMS_ALL.items():
+            if not grams:
+                continue
+            sim = _jaccard(sgrams, grams)
+            if sim > 0.0:
+                scored_ng.append((did, sim))
+        scored_ng.sort(key=lambda x: x[1], reverse=True)
+        if scored_ng:
+            return [did for did, _ in scored_ng[: max(1, k)]]
+
+        # Last resort: return first k demand IDs deterministically (still table-only)
+        return [d["id"] for d in DEMANDS[: max(1, k)]]
+
+    return []
+
+
+def _extract_desc_key_phrases(desc: str, max_phrases: int = 3) -> List[str]:
+    d = (desc or "").strip()
+    if not d:
         return []
+    parts = re.split(r"(?<=[.!?;:])\s+|\n+", d)
+    parts = [p.strip() for p in parts if p and len(p.strip()) >= 8]
 
-    scored: List[Tuple[str, int]] = []
-    for did, dtoks in DEMAND_TOKS_ALL.items():
-        if not dtoks:
-            continue
-        overlap = len(stoks & dtoks)
-        if overlap <= 0:
-            continue
-        scored.append((did, overlap))
+    scored: List[Tuple[int, str]] = []
+    for p in parts:
+        score = 0
+        if REQ_MODAL_RE.search(p):
+            score += 3
+        if REQ_STRUCT_RE.search(p):
+            score += 2
+        if REQ_NUM_RE.search(p):
+            score += 1
+        if UNIT_RE.search(p):
+            score += 1
+        scored.append((score, p))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [did for did, _ in scored[: max(1, k)]]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = [p for sc, p in scored if sc > 0][:max_phrases]
+    if not out:
+        out = parts[:max_phrases]
+    return out
 
 
 def _build_candidates_block(candidate_ids: List[str]) -> str:
     lines = []
     for did in candidate_ids:
-        lines.append(f"- id: {did}\n  demand: {DEMAND_NAME.get(did,'')}\n  description: {DEMAND_DESC.get(did,'')}")
+        name = DEMAND_NAME.get(did, "")
+        desc = DEMAND_DESC.get(did, "")
+        keys = _extract_desc_key_phrases(desc, max_phrases=3)
+        keys_block = "\n    - " + "\n    - ".join(keys) if keys else ""
+        lines.append(
+            f"- id: {did}\n"
+            f"  demand: {name}\n"
+            f"  description: {desc}\n"
+            f"  keyPhrases:{keys_block}"
+        )
     return "\n".join(lines)
 
 
+def _criteria_supported_by_description(criteria_quotes: List[str], did: str) -> bool:
+    desc = (DEMAND_DESC.get(did, "") or "")
+    if not desc:
+        return False
+    desc_lower = desc.lower()
+    desc_toks = DEMAND_TOKS_DESC.get(did, set())
+
+    for q in criteria_quotes:
+        q = (q or "").strip()
+        if len(q) < 4:
+            continue
+        q_lower = q.lower()
+        if q_lower in desc_lower:
+            return True
+        q_toks = _tokenize(q)
+        if len(q_toks & desc_toks) >= CRITERIA_MIN_OVERLAP:
+            return True
+    return False
+
+
+# -------------------------
+# LLM
+# -------------------------
 def _llm_gate_and_match(sentence: str, candidate_ids: List[str], top_k: int) -> Dict[str, Any]:
-    """
-    LLM is forced to justify matches using ONLY the provided description text.
-    Hard validation in code:
-      - evidenceQuote must be substring of sentence
-      - criteriaQuotes must be substrings of the selected demand's description
-      - also require lexical overlap with (name+desc) tokens to avoid nonsense
-    """
     if client is None or not CHAT_DEPLOYMENT:
         return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "no_client"}
+
     if not candidate_ids:
         return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "no_candidates"}
 
@@ -287,7 +395,7 @@ def _llm_gate_and_match(sentence: str, candidate_ids: List[str], top_k: int) -> 
 
     system = (
         "You are a strict requirements-to-demand matcher for technical specifications. "
-        "You MUST base your decision ONLY on the provided candidates (demand + description) and the sentence. "
+        "You MUST base your decision ONLY on the provided candidates (demand + description + keyPhrases) and the sentence. "
         "Return STRICT JSON only."
     )
 
@@ -301,8 +409,9 @@ Select up to {min(int(top_k), MAX_LABELS_PER_CHUNK)} candidate IDs that truly ap
 
 CRITICAL RULES FOR EACH SELECTED LABEL:
 1) evidenceQuote: exact substring copied from the SENTENCE (5–25 words).
-2) criteriaQuotes: 1–3 exact substrings copied from THAT candidate's DESCRIPTION that justify the match.
-3) probability: 0..1. Do NOT output 1.0 unless the match is extremely specific.
+2) criteriaQuotes: 1–3 short phrases that come from the candidate's DESCRIPTION or keyPhrases.
+   Keep each criteria quote short (max ~12 words).
+3) probability: 0..1, calibrated. Do NOT output 1.0 unless the match is extremely specific.
 
 CANDIDATES:
 {candidates_block}
@@ -319,15 +428,15 @@ Return JSON ONLY:
       "id": "candidate_id",
       "probability": 0.0,
       "evidenceQuote": "exact substring from sentence",
-      "criteriaQuotes": ["exact quote from description"]
+      "criteriaQuotes": ["short phrase from description or keyPhrases"]
     }}
   ],
   "notes": "short"
 }}
 
-Hard constraint:
-- If the sentence only contains a keyword (e.g., 'coating', 'voltage', 'test') but does not satisfy the description conditions, DO NOT select it.
-- If you cannot quote criteria from the description, DO NOT select the label.
+Hard constraints:
+- If the sentence only contains a keyword but does not satisfy description conditions, DO NOT select it.
+- If you cannot justify using the description/keyPhrases, DO NOT select it.
 """.strip()
 
     resp = client.chat.completions.create(
@@ -387,18 +496,12 @@ Hard constraint:
         if not cq:
             continue
 
-        desc = (DEMAND_DESC.get(did, "") or "")
-        desc_lower = desc.lower()
-
-        ok_any = any((len(q) >= 4 and q.lower() in desc_lower) for q in cq)
-        if not ok_any:
+        if not _criteria_supported_by_description(cq, did):
             continue
 
-        # Zero-lexical-support reject
+        # zero lexical support reject (still table-only)
         dtoks = DEMAND_TOKS_ALL.get(did, set())
-        if not dtoks:
-            continue
-        if len(stoks & dtoks) == 0:
+        if not dtoks or len(stoks & dtoks) == 0:
             continue
 
         out.append({"id": did, "probability": float(max(0.0, min(1.0, prob)))})
@@ -413,18 +516,74 @@ Hard constraint:
     return {"isRequirement": True, "relevance": float(rel), "labels": out, "notes": "ok"}
 
 
-def _mock(sentence: str, candidate_ids: List[str], top_k: int) -> Dict[str, Any]:
+# -------------------------
+# Deterministic fallback (description-first)
+# -------------------------
+def _deterministic_fallback(sentence: str, candidate_ids: List[str], top_k: int) -> Dict[str, Any]:
     is_req, rel = _is_requirement_fast(sentence)
     if not is_req or rel < RELEVANCE_MIN:
-        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "mock_gate_failed"}
-    return {"isRequirement": True, "relevance": float(rel), "labels": [], "notes": "mock_no_llm_labels"}
+        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "fallback_gate_failed"}
+
+    stoks = _tokenize(sentence)
+    if not stoks:
+        return {"isRequirement": True, "relevance": float(rel), "labels": [], "notes": "fallback_no_tokens"}
+
+    # If retrieval returned nothing (should not happen with ALWAYS_RETURN_CANDIDATES=1),
+    # still ensure we have some candidates.
+    if not candidate_ids:
+        candidate_ids = [d["id"] for d in DEMANDS[: max(1, CANDIDATES_TOPK)]]
+
+    scored: List[Tuple[str, int, int]] = []
+    for did in candidate_ids:
+        desc_toks = DEMAND_TOKS_DESC.get(did, set())
+        name_toks = DEMAND_TOKS_NAME.get(did, set())
+        if not desc_toks:
+            continue
+
+        desc_overlap = len(stoks & desc_toks)
+        name_overlap = len(stoks & name_toks)
+
+        # require description overlap so we don't match on demand name keyword alone
+        if desc_overlap < DESC_MATCH_MIN_OVERLAP:
+            continue
+
+        scored.append((did, desc_overlap, name_overlap))
+
+    if not scored:
+        return {"isRequirement": True, "relevance": float(rel), "labels": [], "notes": "fallback_no_desc_match"}
+
+    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+    labels: List[Dict[str, Any]] = []
+    for did, d_ov, n_ov in scored[:min(top_k, MAX_LABELS_PER_CHUNK)]:
+        p = min(0.95, 0.70 + 0.05 * float(d_ov - DESC_MATCH_MIN_OVERLAP) + 0.02 * float(n_ov))
+        if p >= LABEL_MIN_PROB:
+            labels.append({"id": did, "probability": float(p)})
+
+    labels.sort(key=lambda x: x["probability"], reverse=True)
+    labels = labels[:MAX_LABELS_PER_CHUNK]
+
+    if not labels:
+        return {"isRequirement": True, "relevance": float(rel), "labels": [], "notes": "fallback_probs_too_low"}
+
+    rel = max(float(rel), float(labels[0]["probability"]))
+    return {"isRequirement": True, "relevance": float(rel), "labels": labels, "notes": "fallback_ok"}
 
 
 def _predict_sentence(sentence: str, top_k: int) -> Dict[str, Any]:
     cands = _candidate_retrieval(sentence, CANDIDATES_TOPK)
+
     if USE_MOCK or not USE_LLM:
-        return _mock(sentence, cands, top_k)
-    return _llm_gate_and_match(sentence, cands, top_k)
+        return _deterministic_fallback(sentence, cands, top_k)
+
+    pred = _llm_gate_and_match(sentence, cands, top_k)
+
+    # If LLM says requirement but yields no labels, fallback
+    if bool(pred.get("isRequirement", False)) and not (pred.get("labels") or []):
+        fb = _deterministic_fallback(sentence, cands, top_k)
+        if fb.get("labels"):
+            return fb
+    return pred
 
 
 # -------------------------
@@ -438,8 +597,10 @@ def init():
     _build_demand_indexes()
 
     logger.info(
-        "init(): USE_MOCK=%s USE_LLM=%s demands=%d",
-        USE_MOCK, USE_LLM, len(DEMANDS)
+        "init(): USE_MOCK=%s USE_LLM=%s demands=%d CANDIDATES_TOPK=%d ALWAYS_RETURN_CANDIDATES=%s NGRAM_N=%d "
+        "LABEL_MIN_PROB=%.2f HIGHLIGHT_MIN_PROB=%.2f RELEVANCE_MIN=%.2f",
+        USE_MOCK, USE_LLM, len(DEMANDS), CANDIDATES_TOPK, ALWAYS_RETURN_CANDIDATES, NGRAM_N,
+        LABEL_MIN_PROB, HIGHLIGHT_MIN_PROB, RELEVANCE_MIN
     )
 
     if USE_LLM and not USE_MOCK:
@@ -521,6 +682,7 @@ def run(raw_data):
             if not sentences:
                 continue
 
+            # Preselect likely requirements
             scored_sents: List[Tuple[float, str]] = []
             for s in sentences:
                 if _is_heading_like(s):
@@ -568,6 +730,7 @@ def run(raw_data):
             except Exception:
                 rel = 0.0
 
+            # Highlight guard: avoid topic mentions
             if REQUIRE_MODAL_OR_STRUCTURE and not ALLOW_REQUIREMENTS_WITHOUT_MODAL:
                 has_modal = bool(REQ_MODAL_RE.search(best_sentence))
                 has_struct = bool(REQ_STRUCT_RE.search(best_sentence))
@@ -588,11 +751,6 @@ def run(raw_data):
                     prob = float(p["proba"])
                     if did not in best_doc_probs or prob > best_doc_probs[did]:
                         best_doc_probs[did] = prob
-            else:
-                content["relevantProba"] = 0.0
-                content["cdTransformerPredictions"] = []
-                content["cdLogregPredictions"] = []
-                content["highlightText"] = ""
 
         ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True)]
         document["documentDemandPredictions"] = ids_sorted[:num_preds]
@@ -602,3 +760,4 @@ def run(raw_data):
     except Exception as e:
         logger.exception("run() failed")
         return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
+
