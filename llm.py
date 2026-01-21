@@ -1,486 +1,774 @@
-import os
 import json
-import time
 import logging
-from typing import Dict, Any, List, Optional
+import os
+import re
+import math
+from typing import Any, Dict, List, Tuple, Optional
 
-import numpy as np
 import pandas as pd
 
-from openai import OpenAI
+try:
+    from openai import AzureOpenAI
+except Exception:
+    AzureOpenAI = None
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("score")
 
-# -----------------------------
-# Global state (init-loaded)
-# -----------------------------
-client: Optional[OpenAI] = None
+# -------------------------
+# Tunables (env)
+# -------------------------
+USE_MOCK = os.getenv("USE_MOCK", "0").strip() == "1"  # if 1, never call LLM
 
-DEMANDS: List[Dict[str, str]] = []         # [{"id","name","clarification"}]
-DEMAND_EMB: Optional[np.ndarray] = None    # (n, dim), L2-normalized
+MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "10"))
+MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))  # hard max
+CANDIDATES_TOPK = int(os.getenv("CANDIDATES_TOPK", "12"))
 
-OPENAI_MODEL = "gpt-4o-mini"
-EMBED_MODEL = "text-embedding-3-small"
+LABEL_MIN_PROB = float(os.getenv("LABEL_MIN_PROB", "0.75"))
+HIGHLIGHT_MIN_PROB = float(os.getenv("HIGHLIGHT_MIN_PROB", "0.80"))
+RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.60"))
 
-# -----------------------------
-# Tunables (PoC defaults)
-# -----------------------------
-TOPK = int(os.getenv("RAG_TOPK", "8"))
-MAX_LABELS_PER_CHUNK = 3
-MIN_PROB = 0.30
+MAX_SENTENCES_PER_CHUNK = int(os.getenv("MAX_SENTENCES_PER_CHUNK", "10"))
+MAX_SENTENCES_TO_MODEL = int(os.getenv("MAX_SENTENCES_TO_MODEL", "6"))
 
-# Token/size guards
-MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "4000"))
-MAX_EXPLANATION_CHARS = 500
+# -------------------------
+# Content filters (NEW)
+# -------------------------
+MIN_WORDS_PER_SENTENCE = int(os.getenv("MIN_WORDS_PER_SENTENCE", "4"))  # reject <=3 words
+REJECT_TOC = os.getenv("REJECT_TOC", "1").strip() == "1"
+REJECT_PAGE_ARTIFACTS = os.getenv("REJECT_PAGE_ARTIFACTS", "1").strip() == "1"
 
-# Retries
-EMBED_RETRIES = int(os.getenv("EMBED_RETRIES", "2"))
-CHAT_RETRIES = int(os.getenv("CHAT_RETRIES", "2"))
-RETRY_SLEEP_SEC = float(os.getenv("RETRY_SLEEP_SEC", "0.5"))
+# -------------------------
+# LLM usage: explanation + verify (NO label selection by LLM)
+# -------------------------
+USE_LLM_EXPLAIN_VERIFY = os.getenv("USE_LLM_EXPLAIN_VERIFY", "1").strip() == "1" and not USE_MOCK
+USE_LLM_GATE = os.getenv("USE_LLM_GATE", "0").strip() == "1" and not USE_MOCK
 
-# If you need to cap per-request work
-MAX_CHUNKS_PER_DOC = int(os.getenv("MAX_CHUNKS_PER_DOC", "1000"))
+# -------------------------
+# Deterministic guards
+# -------------------------
+MIN_CANDIDATE_TOKEN_OVERLAP = int(os.getenv("MIN_CANDIDATE_TOKEN_OVERLAP", "1"))
+MIN_LABEL_TOKEN_OVERLAP = int(os.getenv("MIN_LABEL_TOKEN_OVERLAP", "2"))
+MIN_DESC_OVERLAP_FOR_LABEL = int(os.getenv("MIN_DESC_OVERLAP_FOR_LABEL", "1"))
+ZERO_LEXICAL_REJECT = os.getenv("ZERO_LEXICAL_REJECT", "1").strip() == "1"
 
-# -----------------------------
-# Safe helpers
-# -----------------------------
+KEEP_RELATIVE_TO_TOP = float(os.getenv("KEEP_RELATIVE_TO_TOP", "0.88"))
+KEEP_ABSOLUTE_FLOOR = float(os.getenv("KEEP_ABSOLUTE_FLOOR", "0.70"))
 
-def _now() -> float:
-    return time.time()
+W_NAME_OVERLAP = float(os.getenv("W_NAME_OVERLAP", "2.0"))
+W_DESC_OVERLAP = float(os.getenv("W_DESC_OVERLAP", "3.2"))
+W_NAME_PHRASE = float(os.getenv("W_NAME_PHRASE", "3.5"))
 
-def _sleep_backoff(attempt: int):
-    time.sleep(RETRY_SLEEP_SEC * (2 ** attempt))
+SOFTMAX_TEMP = float(os.getenv("SOFTMAX_TEMP", "4.5"))
+PROB_CAP = float(os.getenv("PROB_CAP", "0.95"))
 
-def _safe_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
+MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))
 
-def _l2_normalize(m: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(m, axis=-1, keepdims=True) + 1e-12
-    return m / n
+client = None
+CHAT_DEPLOYMENT = None
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    """
-    Tries to parse JSON even if model wrapped it with text.
-    Strategy:
-    1) direct json.loads
-    2) extract first {...} block
-    """
-    if not s or not isinstance(s, str):
-        return None
+# -------------------------
+# Demands cache
+# -------------------------
+DEMANDS: List[Dict[str, str]] = []
+DEMAND_NAME_RAW: Dict[str, str] = {}
+DEMAND_DESC_RAW: Dict[str, str] = {}
 
-    s = s.strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
+DEMAND_NAME_TOKS: Dict[str, set] = {}
+DEMAND_DESC_TOKS: Dict[str, set] = {}
+DEMAND_ALL_TOKS: Dict[str, set] = {}
 
-    # Try to extract first JSON object
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = s[start:end+1]
-        try:
-            return json.loads(candidate)
-        except Exception:
+# -------------------------
+# Stopwords (English ONLY, minimal)
+# -------------------------
+STOPWORDS = {
+    "the", "and", "or", "to", "of", "in", "on", "for", "with", "a", "an", "as", "at", "by",
+    "from", "into", "over", "under", "than", "then", "that", "this", "these", "those",
+    "be", "is", "are", "was", "were", "been", "being",
+    "it", "its", "they", "them", "their", "we", "our", "you", "your",
+    "can", "could", "may", "might", "will", "would",
+    "not", "no", "yes",
+}
+
+# -------------------------
+# Requirement heuristics (EN only)
+# -------------------------
+REQ_MODAL_RE = re.compile(
+    r"\b(shall|must|required|requirement|should|need to|has to|may not|must not|shall not|prohibit|forbidden)\b",
+    re.IGNORECASE,
+)
+REQ_NUM_RE = re.compile(r"\b\d+([.,]\d+)?\b")
+UNIT_RE = re.compile(r"\b(mm|cm|m|kg|w|kw|mw|v|kv|a|ma|hz|rpm|bar|pa|degc|°c|c|ip\d{2}\b)", re.IGNORECASE)
+
+# -------------------------
+# TOC / page artifact regexes (NEW)
+# -------------------------
+# "1.1 Spare parts .......... 12" or "2 Title ....... 3"
+TOC_DOTS_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?[A-Za-z][A-Za-z0-9 \-_/(),]{2,}\s*\.{5,}\s*\d+\s*$"
+)
+# "1.1 Spare parts 12" (no dots but looks like toc: section + title + page)
+TOC_SECTION_PAGE_RE = re.compile(
+    r"^\s*\d+(\.\d+)+\s+[A-Za-z].{2,}\s+\d+\s*$"
+)
+
+# Page number forms: "12", "- 12 -", "Page 12", "12/345"
+PAGE_ONLY_RE = re.compile(r"^\s*\d+\s*$")
+PAGE_DASH_RE = re.compile(r"^\s*[-–—]+\s*\d+\s*[-–—]+\s*$")
+PAGE_WORD_RE = re.compile(r"^\s*(page|strona)\s*\d+\s*$", re.IGNORECASE)  # "strona" harmless if appears
+PAGE_FRACTION_RE = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
+
+def _json_load_maybe(x: Any) -> Any:
+    if isinstance(x, (bytes, bytearray)):
+        x = x.decode("utf-8", errors="replace")
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
             return None
-
-    return None
-
-def _empty_chunk_predictions(content: Dict[str, Any]) -> None:
-    """
-    Always writes keys expected by app, so app doesn't crash.
-    """
-    content.update({
-        "relevantProba": 0.0,
-        "cdLogregPredictions": [],
-        "cdTransformerPredictions": []
-    })
-
-def _safe_get_byid(document: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Always returns dict (possibly empty).
-    """
-    try:
-        by_id = document.get("contentDomain", {}).get("byId", {})
-        return by_id if isinstance(by_id, dict) else {}
-    except Exception:
-        return {}
-
-def _safe_set_document_predictions(document: Dict[str, Any], preds: List[str]) -> None:
-    """
-    Make sure field exists and is JSON-serializable.
-    """
-    try:
-        document["documentDemandPredictions"] = list(dict.fromkeys(preds))  # stable unique
-    except Exception:
-        document["documentDemandPredictions"] = []
-
-# -----------------------------
-# OpenAI calls (with retries)
-# -----------------------------
-
-def _embed_texts(texts: List[str]) -> Optional[np.ndarray]:
-    """
-    Returns normalized embeddings (n, dim) or None on failure.
-    """
-    if client is None:
-        return None
-    if not texts:
-        return None
-
-    for attempt in range(EMBED_RETRIES + 1):
         try:
-            resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-            emb = np.array([d.embedding for d in resp.data], dtype=np.float32)
-            return _l2_normalize(emb)
-        except Exception as e:
-            logger.warning("Embedding failed (attempt %d/%d): %s", attempt+1, EMBED_RETRIES+1, str(e))
-            if attempt < EMBED_RETRIES:
-                _sleep_backoff(attempt)
-            else:
-                return None
+            return json.loads(s)
+        except Exception:
+            return x
+    return x
 
-def _chat_json(prompt: str) -> Optional[dict]:
-    """
-    Returns parsed JSON dict or None on failure.
-    """
-    if client is None:
-        return None
 
-    for attempt in range(CHAT_RETRIES + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                temperature=0.0,
-                messages=[
-                    {"role": "system", "content": "Output must be valid JSON only. No markdown. No extra text."},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            data = _safe_json_loads(content)
-            if data is not None:
-                return data
+def _find_content_byid(document: Dict[str, Any]) -> Dict[str, Any]:
+    cd = document.get("contentDomain", {})
+    by_id = cd.get("byId", {})
+    return by_id if isinstance(by_id, dict) else {}
 
-            logger.warning("Model returned non-JSON (attempt %d/%d).", attempt+1, CHAT_RETRIES+1)
-            if attempt < CHAT_RETRIES:
-                # Stronger nudge on retry
-                prompt = prompt + "\n\nIMPORTANT: Return JSON only. Do not include any other text."
-                _sleep_backoff(attempt)
-            else:
-                return None
-        except Exception as e:
-            logger.warning("Chat failed (attempt %d/%d): %s", attempt+1, CHAT_RETRIES+1, str(e))
-            if attempt < CHAT_RETRIES:
-                _sleep_backoff(attempt)
-            else:
-                return None
 
-# -----------------------------
-# RAG + scoring
-# -----------------------------
+def _load_demands_xlsx() -> List[Dict[str, str]]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "demands.xlsx"),
+        os.path.join(here, "assets", "demands.xlsx"),
+    ]
+    model_dir = os.getenv("AZUREML_MODEL_DIR")
+    if model_dir:
+        candidates += [
+            os.path.join(model_dir, "demands.xlsx"),
+            os.path.join(model_dir, "assets", "demands.xlsx"),
+        ]
 
-def _topk_demands(chunk_text: str, k: int) -> List[Dict[str, str]]:
-    """
-    Vector retrieval. If embeddings are unavailable, return empty.
-    """
-    if DEMAND_EMB is None or not DEMANDS:
+    for p in candidates:
+        if os.path.exists(p):
+            df = pd.read_excel(p)
+            df.columns = [c.strip().lower() for c in df.columns]
+            if "demand_id" not in df.columns and "id" in df.columns:
+                df = df.rename(columns={"id": "demand_id"})
+            if "description" not in df.columns and "demand_description" in df.columns:
+                df = df.rename(columns={"demand_description": "description"})
+
+            required = {"demand_id", "demand", "description"}
+            missing = required - set(df.columns)
+            if missing:
+                raise RuntimeError(f"demands.xlsx missing columns: {sorted(list(missing))}. Found: {list(df.columns)}")
+
+            out: List[Dict[str, str]] = []
+            for _, r in df.fillna("").iterrows():
+                did = str(r["demand_id"]).strip()
+                if not did or did.lower() == "nan":
+                    continue
+                out.append({"id": did, "demand": str(r["demand"]).strip(), "description": str(r["description"]).strip()})
+            logger.info("Loaded %d demands from %s", len(out), p)
+            return out
+
+    raise RuntimeError(f"demands.xlsx not found. Tried: {candidates}")
+
+
+def _tokenize(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = []
+    for t in s.split():
+        if len(t) < 3:
+            continue
+        if t in STOPWORDS:
+            continue
+        toks.append(t)
+    return toks
+
+
+def _tokset(s: str) -> set:
+    return set(_tokenize(s))
+
+
+def _word_count(s: str) -> int:
+    # count words loosely
+    return len([w for w in re.findall(r"[A-Za-z0-9]+", s or "") if w.strip()])
+
+
+def _is_toc_line(s: str) -> bool:
+    if not REJECT_TOC:
+        return False
+    t = (s or "").strip()
+    if len(t) < 6:
+        return False
+    if TOC_DOTS_RE.match(t):
+        return True
+    if TOC_SECTION_PAGE_RE.match(t):
+        return True
+    # also: many dots anywhere + ends with page number
+    if re.search(r"\.{5,}", t) and re.search(r"\d+\s*$", t):
+        return True
+    return False
+
+
+def _is_page_artifact(s: str) -> bool:
+    if not REJECT_PAGE_ARTIFACTS:
+        return False
+    t = (s or "").strip()
+    if not t:
+        return True
+    if PAGE_ONLY_RE.match(t):
+        return True
+    if PAGE_DASH_RE.match(t):
+        return True
+    if PAGE_WORD_RE.match(t):
+        return True
+    if PAGE_FRACTION_RE.match(t):
+        return True
+    return False
+
+
+def _should_reject_sentence(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return True
+    if _word_count(t) < MIN_WORDS_PER_SENTENCE:
+        return True
+    if _is_page_artifact(t):
+        return True
+    if _is_toc_line(t):
+        return True
+    return False
+
+
+def _build_demand_indexes():
+    global DEMAND_NAME_RAW, DEMAND_DESC_RAW, DEMAND_NAME_TOKS, DEMAND_DESC_TOKS, DEMAND_ALL_TOKS
+
+    DEMAND_NAME_RAW = {}
+    DEMAND_DESC_RAW = {}
+    DEMAND_NAME_TOKS = {}
+    DEMAND_DESC_TOKS = {}
+    DEMAND_ALL_TOKS = {}
+
+    for d in DEMANDS:
+        did = d["id"]
+        name = (d.get("demand", "") or "").strip()
+        desc = (d.get("description", "") or "").strip()
+
+        DEMAND_NAME_RAW[did] = name.lower()
+        DEMAND_DESC_RAW[did] = desc.lower()
+
+        name_toks = _tokset(name)
+        desc_toks = _tokset(desc)
+
+        DEMAND_NAME_TOKS[did] = name_toks
+        DEMAND_DESC_TOKS[did] = desc_toks
+        DEMAND_ALL_TOKS[did] = set(name_toks | desc_toks)
+
+
+def _is_requirement_fast(text: str) -> Tuple[bool, float]:
+    t = (text or "").strip()
+    if len(t) < MIN_CHUNK_LEN:
+        return False, 0.0
+
+    has_modal = bool(REQ_MODAL_RE.search(t))
+    has_num = bool(REQ_NUM_RE.search(t))
+    has_unit = bool(UNIT_RE.search(t))
+
+    if has_modal and (has_num or has_unit):
+        return True, 0.85
+    if has_modal:
+        return True, 0.70
+    if has_num and has_unit:
+        return True, 0.65
+    if has_num:
+        return True, 0.60
+    return False, 0.20
+
+
+def _split_into_sentences_or_lines(chunk_text: str) -> List[str]:
+    t = (chunk_text or "").strip()
+    if not t:
         return []
 
-    chunk_text = (chunk_text or "").strip()
-    if not chunk_text:
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    tableish = (len(lines) >= 6) or any(("|" in ln or "\t" in ln) for ln in lines)
+    if tableish:
+        out = [ln for ln in lines if len(ln) >= MIN_CHUNK_LEN]
+        return out[:MAX_SENTENCES_PER_CHUNK]
+
+    parts = re.split(r"(?<=[.!?])\s+|\n+", t)
+    parts = [p.strip() for p in parts if p and p.strip()]
+    return parts[:MAX_SENTENCES_PER_CHUNK]
+
+
+def _name_phrase_hit(sentence_lower: str, did: str) -> bool:
+    name = (DEMAND_NAME_RAW.get(did, "") or "").strip()
+    if not name:
+        return False
+    if " " in name and len(name) >= 6:
+        return name in sentence_lower
+    return False
+
+
+def _candidate_retrieval(sentence: str, k: int) -> List[str]:
+    stoks = set(_tokenize(sentence))
+    s_lower = (sentence or "").lower()
+    if not stoks:
         return []
 
-    q = _embed_texts([chunk_text])
-    if q is None:
+    scored: List[Tuple[str, float]] = []
+    anchors: List[str] = []
+
+    for did, all_toks in DEMAND_ALL_TOKS.items():
+        if not all_toks:
+            continue
+        overlap = len(stoks & all_toks)
+        if _name_phrase_hit(s_lower, did):
+            anchors.append(did)
+        if overlap >= MIN_CANDIDATE_TOKEN_OVERLAP:
+            scored.append((did, float(overlap)))
+
+    if not scored and not anchors:
         return []
 
-    sims = DEMAND_EMB @ q[0]  # cosine, both normalized
-    idx = np.argsort(-sims)[:k]
-    return [DEMANDS[i] for i in idx]
+    anchor_set = set(anchors)
+    boosted: List[Tuple[str, float]] = []
+    present = set()
 
-def _demands_context(demands_subset: List[Dict[str, str]]) -> str:
-    lines = []
-    for d in demands_subset:
-        lines.append(
-            f"- id: {d['id']}\n"
-            f"  name: {d['name']}\n"
-            f"  clarification: {d['clarification']}"
-        )
-    return "\n".join(lines)
+    for did, sc in scored:
+        if did in anchor_set:
+            sc += W_NAME_PHRASE
+        boosted.append((did, sc))
+        present.add(did)
 
-def _score_one_chunk(chunk_id: str, chunk_text: str, demands_subset: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    Returns normalized scoring output:
-    {"chunkId":..., "demandIds":[{"id":..,"probability":..}], "explanation":...}
-    Always returns valid dict (never raises).
-    """
-    chunk_text = (chunk_text or "").strip()
-    if not chunk_text or not demands_subset:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "Empty text or no candidate demands."}
+    for did in anchors:
+        if did not in present:
+            boosted.append((did, W_NAME_PHRASE))
 
-    # size guard
-    if len(chunk_text) > MAX_CHUNK_CHARS:
-        chunk_text = chunk_text[:MAX_CHUNK_CHARS]
+    boosted.sort(key=lambda x: x[1], reverse=True)
+    return [did for did, _ in boosted[: max(1, k)]]
 
-    ctx = _demands_context(demands_subset)
-    allowed = set(d["id"] for d in demands_subset)
 
-    prompt = f"""
-Rules & Constraints:
-- Match ONLY when the chunk content aligns with the demand's clarification.
-- You MUST use only the predefined demands from the list provided.
-- Find maximum three demands per chunk.
-- If no relevant demands found, return empty demandIds array.
-- Exclude demands with probability below {MIN_PROB}.
+def _score_label(sentence: str, did: str) -> Tuple[float, int, int, int, bool]:
+    stoks = set(_tokenize(sentence))
+    if not stoks:
+        return 0.0, 0, 0, 0, False
 
-Scoring Guidelines (0.0 to 1.0):
-- 1.0: Direct, explicit match.
-- 0.7-0.9: Strong semantic relationship.
-- 0.5-0.7: Moderate relationship.
-- 0.3-0.5: Weak relationship.
-- Below {MIN_PROB}: Not relevant.
+    name_toks = DEMAND_NAME_TOKS.get(did, set())
+    desc_toks = DEMAND_DESC_TOKS.get(did, set())
+    if not name_toks and not desc_toks:
+        return 0.0, 0, 0, 0, False
 
-Demands:
-{ctx}
+    oname = len(stoks & name_toks)
+    odesc = len(stoks & desc_toks)
+    ototal = oname + odesc
+    phrase_hit = _name_phrase_hit((sentence or "").lower(), did)
 
-Text chunk to analyze:
-chunkId: {chunk_id}
-text: {chunk_text}
+    score = W_NAME_OVERLAP * float(oname) + W_DESC_OVERLAP * float(odesc)
+    if phrase_hit:
+        score += W_NAME_PHRASE
 
-Respond with valid JSON only:
+    return float(score), int(ototal), int(oname), int(odesc), bool(phrase_hit)
+
+
+def _softmax_probs(scores: List[float], temp: float) -> List[float]:
+    if not scores:
+        return []
+    t = max(0.1, float(temp))
+    m = max(scores)
+    exps = [math.exp((s - m) / t) for s in scores]
+    z = sum(exps) if exps else 1.0
+    return [e / z for e in exps]
+
+
+def _prob_postprocess(p: float) -> float:
+    p = max(0.0, min(1.0, float(p)))
+    p = 0.55 + 0.45 * p
+    return float(min(PROB_CAP, p))
+
+
+def _llm_gate(sentence: str) -> Tuple[bool, float]:
+    if client is None or not CHAT_DEPLOYMENT:
+        return _is_requirement_fast(sentence)
+
+    system = "Return STRICT JSON only. No prose."
+    user = f"""
+Decide whether the SENTENCE contains a concrete requirement/specification that should be highlighted.
+Return JSON only:
 {{
-  "chunkId": "{chunk_id}",
-  "demandIds": [{{"id":"d1","probability":0.85}}],
-  "explanation": "brief explanation"
+  "isRequirement": true|false,
+  "relevance": 0.0
 }}
+SENTENCE:
+{sentence}
+Guidance:
+- requirement signals: must/shall/need to/has to, numbers/units, constraints, tests, prohibitions.
+- relevance 0..1. If NOT requirement, keep it < {RELEVANCE_MIN}.
 """.strip()
 
-    data = _chat_json(prompt)
-    if data is None:
-        return {"chunkId": chunk_id, "demandIds": [], "explanation": "Model call failed or invalid JSON."}
-
-    # sanitize output
-    out = {
-        "chunkId": chunk_id,
-        "demandIds": [],
-        "explanation": str(data.get("explanation", ""))[:MAX_EXPLANATION_CHARS],
-    }
-
-    demand_ids = data.get("demandIds", [])
-    if not isinstance(demand_ids, list):
-        demand_ids = []
-
-    cleaned = []
-    for item in demand_ids:
-        if not isinstance(item, dict):
-            continue
-        did = str(item.get("id", "")).strip()
-        prob = _safe_float(item.get("probability", 0.0), 0.0)
-        if did in allowed and prob >= MIN_PROB:
-            cleaned.append({"id": did, "probability": float(prob)})
-
-    cleaned = sorted(cleaned, key=lambda x: x["probability"], reverse=True)[:MAX_LABELS_PER_CHUNK]
-    out["demandIds"] = cleaned
-    return out
-
-# -----------------------------
-# Azure ML entrypoints
-# -----------------------------
-
-def init():
-    """
-    Fail-soft init:
-    - If anything fails, we keep endpoint alive and return empty predictions at runtime.
-    """
-    global client, DEMANDS, DEMAND_EMB, OPENAI_MODEL, EMBED_MODEL
-
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", OPENAI_MODEL)
-    EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", EMBED_MODEL)
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if api_key:
-        try:
-            client = OpenAI(api_key=api_key)
-        except Exception as e:
-            client = None
-            logger.error("OpenAI client init failed: %s", str(e))
-    else:
-        client = None
-        logger.error("Missing OPENAI_API_KEY. Endpoint will return empty predictions.")
-
-    # Load Excel (fail-soft)
+    resp = client.chat.completions.create(
+        model=CHAT_DEPLOYMENT,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.0,
+        max_tokens=180,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
     try:
-        base_dir = os.getenv("AZUREML_MODEL_DIR", os.getcwd())
-        demands_path = os.getenv("DEMANDS_XLSX_PATH", os.path.join(base_dir, "demands.xlsx"))
+        data = json.loads(raw)
+        is_req = bool(data.get("isRequirement", False))
+        rel = float(data.get("relevance", 0.0) or 0.0)
+        return is_req, rel
+    except Exception:
+        return _is_requirement_fast(sentence)
 
-        if not os.path.exists(demands_path):
-            logger.error("Demands file not found: %s. Endpoint will return empty predictions.", demands_path)
-            DEMANDS = []
-            DEMAND_EMB = None
-            return
 
-        df = pd.read_excel(demands_path)
+def _llm_explain_and_verify(sentence: str, did: str) -> Tuple[bool, str]:
+    if client is None or not CHAT_DEPLOYMENT:
+        return True, ""
 
-        # Your known column names (as you said: already known from your files)
-        df = df.rename(columns={
-            "demand_id": "id",
-            "demand": "name",
-            "demand_description": "clarification",
-        })
+    demand_name = (DEMAND_NAME_RAW.get(did, "") or "").strip()
+    demand_desc = (DEMAND_DESC_RAW.get(did, "") or "").strip()
 
-        # Validate columns (fail-soft)
-        for col in ("id", "name", "clarification"):
-            if col not in df.columns:
-                logger.error("Missing column '%s' in demands.xlsx. Endpoint will return empty predictions.", col)
-                DEMANDS = []
-                DEMAND_EMB = None
-                return
+    system = "Return STRICT JSON only. No prose outside JSON."
+    user = f"""
+You are verifying a demand-label match for a document sentence.
+You MUST use ONLY the provided demand name + description and the sentence. No outside knowledge.
 
-        DEMANDS = []
-        demand_texts = []
-        for _, r in df.iterrows():
-            did = str(r.get("id", "")).strip()
-            name = str(r.get("name", "")).strip()
-            clar = str(r.get("clarification", "")).strip()
+DEMAND_ID: {did}
+DEMAND_NAME: {demand_name}
+DEMAND_DESCRIPTION: {demand_desc}
 
-            if not did or not name:
+SENTENCE:
+{sentence}
+
+Return JSON ONLY:
+{{
+  "verdict": "PASS" | "FAIL",
+  "explanation": "1-2 sentences max, why it matches the description (or why it doesn't)."
+}}
+
+Rules:
+- PASS only if the sentence satisfies conditions implied by the DESCRIPTION (not just sharing a keyword).
+- If the sentence is a heading/TOC/page artifact, verdict MUST be FAIL.
+- If uncertain, FAIL.
+- explanation must be concise (max 2 sentences).
+""".strip()
+
+    resp = client.chat.completions.create(
+        model=CHAT_DEPLOYMENT,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.0,
+        max_tokens=220,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    try:
+        data = json.loads(raw)
+        verdict = str(data.get("verdict", "")).strip().upper()
+        explanation = str(data.get("explanation", "") or "").strip()
+        if explanation:
+            parts = re.split(r"(?<=[.!?])\s+", explanation)
+            explanation = " ".join(parts[:2]).strip()
+        return verdict == "PASS", explanation
+    except Exception:
+        return False, ""
+
+
+def _deterministic_predict(sentence: str, top_k: int) -> Dict[str, Any]:
+    is_req_fast, rel_fast = _is_requirement_fast(sentence)
+
+    candidate_ids = _candidate_retrieval(sentence, CANDIDATES_TOPK)
+    if not candidate_ids:
+        return {"isRequirement": bool(is_req_fast), "relevance": float(rel_fast), "labels": [], "explanations": {}, "notes": "no_candidates"}
+
+    scored: List[Tuple[str, float, int, int, int, bool]] = []
+    for did in candidate_ids:
+        sc, ototal, oname, odesc, phrase_hit = _score_label(sentence, did)
+        scored.append((did, sc, ototal, oname, odesc, phrase_hit))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    filtered: List[Tuple[str, float]] = []
+    for did, sc, ototal, oname, odesc, phrase_hit in scored:
+        if ZERO_LEXICAL_REJECT and ototal == 0:
+            continue
+        if ototal < MIN_LABEL_TOKEN_OVERLAP:
+            continue
+        if odesc < MIN_DESC_OVERLAP_FOR_LABEL:
+            continue
+        filtered.append((did, sc))
+        if len(filtered) >= max(1, top_k):
+            break
+
+    if not filtered:
+        return {"isRequirement": bool(is_req_fast), "relevance": float(rel_fast), "labels": [], "explanations": {}, "notes": "no_labels_after_guards"}
+
+    dids = [d for d, _ in filtered]
+    scs = [s for _, s in filtered]
+    probs = _softmax_probs(scs, SOFTMAX_TEMP)
+    probs = [_prob_postprocess(p) for p in probs]
+
+    pairs = list(zip(dids, probs))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+
+    top_prob = pairs[0][1]
+    kept: List[Tuple[str, float]] = []
+    for did, p in pairs:
+        if p < KEEP_ABSOLUTE_FLOOR:
+            continue
+        if p < top_prob * KEEP_RELATIVE_TO_TOP:
+            continue
+        if p < LABEL_MIN_PROB:
+            continue
+        kept.append((did, p))
+        if len(kept) >= MAX_LABELS_PER_CHUNK:
+            break
+
+    if not kept:
+        return {"isRequirement": bool(is_req_fast), "relevance": float(rel_fast), "labels": [], "explanations": {}, "notes": "filtered_out_by_thresholds"}
+
+    rel = max(float(rel_fast), float(kept[0][1]))
+    labels_out = [{"id": did, "probability": float(p)} for did, p in kept]
+    return {"isRequirement": bool(is_req_fast), "relevance": float(rel), "labels": labels_out, "explanations": {}, "notes": "ok"}
+
+
+def _predict_sentence(sentence: str, top_k: int) -> Dict[str, Any]:
+    # Hard reject for TOC/page/short text BEFORE any scoring
+    if _should_reject_sentence(sentence):
+        return {"isRequirement": False, "relevance": 0.0, "labels": [], "explanations": {}, "notes": "rejected_artifact"}
+
+    pred = _deterministic_predict(sentence, top_k=top_k)
+
+    if USE_LLM_GATE:
+        is_req, rel = _llm_gate(sentence)
+        pred["isRequirement"] = bool(is_req)
+        pred["relevance"] = float(rel)
+        if not is_req:
+            pred["labels"] = []
+            pred["explanations"] = {}
+            pred["notes"] = "llm_gate_blocked"
+            return pred
+
+    if USE_LLM_EXPLAIN_VERIFY and pred.get("labels"):
+        final_labels: List[Dict[str, Any]] = []
+        explanations: Dict[str, str] = {}
+
+        for lb in pred["labels"]:
+            did = str(lb.get("id", "")).strip()
+            if not did:
                 continue
+            ok, expl = _llm_explain_and_verify(sentence, did)
+            if ok:
+                final_labels.append(lb)
+                if expl:
+                    explanations[did] = expl
 
-            DEMANDS.append({"id": did, "name": name, "clarification": clar})
-            demand_texts.append(f"{name} | {clar}")
+        final_labels.sort(key=lambda x: float(x.get("probability", 0.0) or 0.0), reverse=True)
+        final_labels = final_labels[:MAX_LABELS_PER_CHUNK]
 
-        if not DEMANDS:
-            logger.error("No demands loaded from demands.xlsx. Endpoint will return empty predictions.")
-            DEMAND_EMB = None
-            return
+        pred["labels"] = final_labels
+        pred["explanations"] = explanations
 
-        # Precompute embeddings (fail-soft)
-        emb = _embed_texts(demand_texts)
-        if emb is None:
-            logger.error("Failed to precompute demand embeddings. Endpoint will return empty predictions.")
-            DEMAND_EMB = None
-            return
+        if not final_labels:
+            pred["notes"] = "all_labels_failed_verification"
 
-        DEMAND_EMB = emb
-        logger.info("Init OK. demands=%d, emb_dim=%d", len(DEMANDS), DEMAND_EMB.shape[1])
+    return pred
 
-    except Exception as e:
-        logger.error("Init failed (fail-soft): %s", str(e), exc_info=True)
-        DEMANDS = []
-        DEMAND_EMB = None
+
+# -------------------------
+# AML entrypoints
+# -------------------------
+def init():
+    global client, CHAT_DEPLOYMENT, DEMANDS, USE_MOCK
+
+    USE_MOCK = os.getenv("USE_MOCK", "0").strip() == "1"
+    DEMANDS = _load_demands_xlsx()
+    _build_demand_indexes()
+
+    logger.info(
+        "init(): USE_MOCK=%s USE_LLM_EXPLAIN_VERIFY=%s USE_LLM_GATE=%s demands=%d "
+        "MIN_WORDS_PER_SENTENCE=%d REJECT_TOC=%s REJECT_PAGE_ARTIFACTS=%s",
+        USE_MOCK, USE_LLM_EXPLAIN_VERIFY, USE_LLM_GATE, len(DEMANDS),
+        MIN_WORDS_PER_SENTENCE, str(REJECT_TOC), str(REJECT_PAGE_ARTIFACTS)
+    )
+
+    if (USE_LLM_EXPLAIN_VERIFY or USE_LLM_GATE) and not USE_MOCK:
+        if AzureOpenAI is None:
+            raise RuntimeError("openai package not available but LLM usage enabled")
+
+        aoai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+        aoai_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+        aoai_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip() or "2024-06-01"
+
+        CHAT_DEPLOYMENT = (
+            os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        )
+
+        if not (aoai_endpoint and aoai_key and CHAT_DEPLOYMENT):
+            raise RuntimeError(
+                "Missing AOAI env vars. Need: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT)."
+            )
+
+        client = AzureOpenAI(
+            azure_endpoint=aoai_endpoint,
+            api_key=aoai_key,
+            api_version=aoai_version,
+        )
 
 
 def run(raw_data):
     """
-    Fail-soft run:
-    Always returns {"predictions": document} with required keys set.
-    Never raises.
+    Contract (do not break):
+      { "predictions": <document> }
+
+    document MUST include:
+      documentDemandPredictions: ["id1","id2", ...]  (ARRAY OF STRINGS)
+
+    per chunk:
+      relevantProba: float
+      cdTransformerPredictions: [{label, proba}]
+      cdLogregPredictions: SAME SHAPE (mirror)
     """
-    t0 = _now()
-
-    # Default response if anything goes wrong
-    def _default_response(doc: Dict[str, Any]) -> Dict[str, Any]:
-        # ensure all chunks have required keys
-        by_id = _safe_get_byid(doc)
-        for _, content in by_id.items():
-            if isinstance(content, dict):
-                _empty_chunk_predictions(content)
-        _safe_set_document_predictions(doc, [])
-        return {"predictions": doc}
-
     try:
-        # Parse input
-        if raw_data is None or (isinstance(raw_data, str) and not raw_data.strip()):
-            logger.warning("Empty request body.")
-            return {"predictions": {"documentDemandPredictions": [], "contentDomain": {"byId": {}}}}
+        req = _json_load_maybe(raw_data)
+        if not isinstance(req, dict):
+            return {"error": "Bad request: body must be JSON object", "predictions": {"documentDemandPredictions": []}}
 
-        request_data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-        if not isinstance(request_data, dict):
-            logger.warning("Request is not a dict.")
-            return {"predictions": {"documentDemandPredictions": [], "contentDomain": {"byId": {}}}}
+        if "document" not in req:
+            return {"error": "Bad request: missing 'document'", "predictions": {"documentDemandPredictions": []}}
 
-        document = request_data.get("document", {})
+        document = _json_load_maybe(req["document"])
         if not isinstance(document, dict):
-            logger.warning("'document' missing or invalid.")
-            return {"predictions": {"documentDemandPredictions": [], "contentDomain": {"byId": {}}}}
+            return {"error": "Bad request: 'document' must be JSON object", "predictions": {"documentDemandPredictions": []}}
 
-        num_pred = int(request_data.get("num_preds", 3))
+        num_preds = int(req.get("num_preds", MAX_LABELS_PER_CHUNK))
+        num_preds = max(1, min(10, num_preds))
+        num_preds = min(num_preds, MAX_LABELS_PER_CHUNK)
 
-        by_id = _safe_get_byid(document)
+        by_id = _find_content_byid(document)
 
-        # hard cap chunks per doc
-        items = list(by_id.items())[:MAX_CHUNKS_PER_DOC]
+        best_doc_probs: Dict[str, float] = {}
+        debug_left = MAX_DEBUG_CHUNKS
 
-        document_demand_predictions: List[str] = []
-
-        # If init failed -> return empty but consistent output
-        if client is None or DEMAND_EMB is None or not DEMANDS:
-            logger.warning("Model not ready (client/embeddings/demands missing). Returning empty predictions.")
-            for _, content in items:
-                if isinstance(content, dict):
-                    _empty_chunk_predictions(content)
-            _safe_set_document_predictions(document, [])
-            return {"predictions": document}
-
-        for chunk_id, content in items:
+        for cid, content in by_id.items():
             if not isinstance(content, dict):
                 continue
 
-            text = (content.get("text") or "").strip()
-            if len(text) > MAX_CHUNK_CHARS:
-                text = text[:MAX_CHUNK_CHARS]
+            chunk_text = (str(content.get("text", "") or "")).strip()
 
-            # RAG retrieve
-            candidates = _topk_demands(text, k=TOPK)
+            # Reject tiny chunks early (<=3 words)
+            if _word_count(chunk_text) <= 3:
+                content["relevantProba"] = 0.0
+                content["cdTransformerPredictions"] = []
+                content["cdLogregPredictions"] = []
+                content["highlightText"] = ""
+                content["labelExplanations"] = []
+                continue
 
-            # LLM score
-            scored = _score_one_chunk(str(chunk_id), text, candidates)
-            demand_ids = scored.get("demandIds", [])
+            # Always set expected keys/types
+            content["relevantProba"] = 0.0
+            content["cdTransformerPredictions"] = []
+            content["cdLogregPredictions"] = []
+            content["highlightText"] = ""
+            content["labelExplanations"] = []
 
-            # Map to existing format
-            cd_transformer_predictions = []
-            for d in demand_ids:
-                if isinstance(d, dict):
-                    cd_transformer_predictions.append({
-                        "label": str(d.get("id", "")).strip(),
-                        "proba": float(_safe_float(d.get("probability", 0.0), 0.0))
-                    })
+            if debug_left > 0:
+                logger.info("chunk=%s sample=%r", cid, chunk_text[:180])
+                debug_left -= 1
 
-            cd_transformer_predictions = sorted(cd_transformer_predictions, key=lambda x: x["proba"], reverse=True)[:max(0, num_pred)]
-            relevant_proba = max([p["proba"] for p in cd_transformer_predictions], default=0.0)
+            sentences_raw = _split_into_sentences_or_lines(chunk_text)
 
-            content.update({
-                "relevantProba": float(relevant_proba),
-                "cdLogregPredictions": [],  # keep contract stable
-                "cdTransformerPredictions": cd_transformer_predictions
-            })
+            # Filter TOC/page/short sentences
+            sentences = [s for s in sentences_raw if not _should_reject_sentence(s)]
+            if not sentences:
+                continue
 
-            for p in cd_transformer_predictions:
-                if p.get("label"):
-                    document_demand_predictions.append(p["label"])
+            # Rank sentences by "table alignment signal" + requirement signal.
+            scored_sents: List[Tuple[float, str]] = []
+            for s in sentences:
+                is_req, rel_fast = _is_requirement_fast(s)
+                cands = _candidate_retrieval(s, k=6)
+                cand_signal = 0.08 * float(len(cands))
+                score = (0.35 * rel_fast) + cand_signal
+                if is_req:
+                    score += 0.05
+                scored_sents.append((score, s))
 
-        _safe_set_document_predictions(document, document_demand_predictions)
+            scored_sents.sort(key=lambda x: x[0], reverse=True)
+            candidates_for_model = [s for _, s in scored_sents[:MAX_SENTENCES_TO_MODEL] if s.strip()]
 
-        logger.info("run() done in %.3fs chunks=%d", _now() - t0, len(items))
+            best_chunk_pred: Optional[Dict[str, Any]] = None
+            best_top1 = 0.0
+            best_sentence = ""
+
+            for s in candidates_for_model:
+                pred = _predict_sentence(s, top_k=num_preds)
+                labels = pred.get("labels", []) or []
+                if not isinstance(labels, list) or not labels:
+                    continue
+
+                labels_sorted = sorted(labels, key=lambda x: float(x.get("probability", 0.0) or 0.0), reverse=True)
+                top1 = float(labels_sorted[0].get("probability", 0.0) or 0.0)
+
+                if top1 > best_top1:
+                    best_top1 = top1
+                    best_chunk_pred = pred
+                    best_sentence = s
+
+            if best_chunk_pred is None:
+                continue
+
+            labels = best_chunk_pred.get("labels", []) or []
+            labels_sorted = sorted(labels, key=lambda x: float(x.get("probability", 0.0) or 0.0), reverse=True)
+            labels_sorted = labels_sorted[:num_preds]
+
+            final_labels = [{"label": str(lb["id"]), "proba": float(lb["probability"])} for lb in labels_sorted]
+
+            top1 = float(final_labels[0]["proba"]) if final_labels else 0.0
+            is_req = bool(best_chunk_pred.get("isRequirement", False))
+            try:
+                rel = float(best_chunk_pred.get("relevance", 0.0) or 0.0)
+            except Exception:
+                rel = 0.0
+
+            should_highlight = bool(is_req and top1 >= HIGHLIGHT_MIN_PROB)
+
+            if should_highlight and final_labels:
+                content["relevantProba"] = float(max(rel, top1))
+                content["cdTransformerPredictions"] = final_labels
+                content["cdLogregPredictions"] = list(final_labels)
+                content["highlightText"] = best_sentence
+
+                expl_map = best_chunk_pred.get("explanations", {}) or {}
+                if isinstance(expl_map, dict) and expl_map:
+                    content["labelExplanations"] = [
+                        {"label": did, "explanation": str(expl_map.get(did, ""))}
+                        for did in [p["label"] for p in final_labels]
+                        if str(expl_map.get(did, "")).strip()
+                    ]
+
+                for p in final_labels:
+                    did = p["label"]
+                    prob = float(p["proba"])
+                    if did not in best_doc_probs or prob > best_doc_probs[did]:
+                        best_doc_probs[did] = prob
+            else:
+                content["relevantProba"] = 0.0
+                content["cdTransformerPredictions"] = []
+                content["cdLogregPredictions"] = []
+                content["highlightText"] = ""
+                content["labelExplanations"] = []
+
+        ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True)]
+        document["documentDemandPredictions"] = ids_sorted[:num_preds]
+
         return {"predictions": document}
 
     except Exception as e:
-        # Absolute last-resort fallback: never crash endpoint
-        logger.error("run() failed (fail-soft): %s", str(e), exc_info=True)
-        try:
-            # attempt to recover document if present
-            if isinstance(raw_data, str):
-                rd = _safe_json_loads(raw_data) or {}
-            else:
-                rd = raw_data if isinstance(raw_data, dict) else {}
-            doc = rd.get("document", {}) if isinstance(rd, dict) else {}
-            if not isinstance(doc, dict):
-                doc = {}
-            return _default_response(doc)
-        except Exception:
-            return {"predictions": {"documentDemandPredictions": [], "contentDomain": {"byId": {}}}}
+        logger.exception("run() failed")
+        return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
