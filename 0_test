@@ -17,10 +17,9 @@ logger = logging.getLogger("score")
 # -------------------------
 # Tunables (env)
 # -------------------------
-USE_MOCK = os.getenv("USE_MOCK", "0").strip() == "1"
+USE_MOCK = os.getenv("USE_MOCK", "0").strip() == "1"  # if 1, never call LLM
 
 MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "10"))
-
 MAX_LABELS_PER_CHUNK = int(os.getenv("MAX_LABELS_PER_CHUNK", "3"))
 CANDIDATES_TOPK = int(os.getenv("CANDIDATES_TOPK", "10"))
 
@@ -28,40 +27,77 @@ LABEL_MIN_PROB = float(os.getenv("LABEL_MIN_PROB", "0.75"))
 HIGHLIGHT_MIN_PROB = float(os.getenv("HIGHLIGHT_MIN_PROB", "0.80"))
 RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.60"))
 
-# Sentence/line processing
-MAX_LINES_PER_CHUNK = int(os.getenv("MAX_LINES_PER_CHUNK", "18"))
-MAX_LINES_TO_LLM = int(os.getenv("MAX_LINES_TO_LLM", "6"))
+MAX_SENTENCES_PER_CHUNK = int(os.getenv("MAX_SENTENCES_PER_CHUNK", "10"))
+MAX_SENTENCES_TO_LLM = int(os.getenv("MAX_SENTENCES_TO_LLM", "4"))
 
-# --- NEW: hard post-filters to prevent nonsense labels ---
-# Minimal token overlap between sentence and (demand + description)
-OVERLAP_MIN = int(os.getenv("OVERLAP_MIN", "2"))
-# Require at least this many criteria hits (token-level) in the sentence
-CRITERIA_HITS_MIN = int(os.getenv("CRITERIA_HITS_MIN", "1"))
+# -------------------------
+# Key behavior switches
+# -------------------------
+# Label selection is deterministic and NEVER produced by LLM.
+# LLM may only be used as an optional "requirement gate" (isRequirement/relevance).
+USE_LLM_GATE = os.getenv("USE_LLM_GATE", "0").strip() == "1" and not USE_MOCK
+
+# Strict lexical guards
+MIN_CANDIDATE_TOKEN_OVERLAP = int(os.getenv("MIN_CANDIDATE_TOKEN_OVERLAP", "1"))  # allow recall
+MIN_LABEL_TOKEN_OVERLAP = int(os.getenv("MIN_LABEL_TOKEN_OVERLAP", "2"))          # accept label only if >=2 overlap total (name+desc)
+ZERO_LEXICAL_REJECT = os.getenv("ZERO_LEXICAL_REJECT", "1").strip() == "1"         # enforce "0% support => reject"
+
+# Scoring weights (deterministic)
+W_NAME_OVERLAP = float(os.getenv("W_NAME_OVERLAP", "3.0"))
+W_DESC_OVERLAP = float(os.getenv("W_DESC_OVERLAP", "1.0"))
+W_NAME_PHRASE = float(os.getenv("W_NAME_PHRASE", "8.0"))
 
 MAX_DEBUG_CHUNKS = int(os.getenv("MAX_DEBUG_CHUNKS", "0"))
 
 client = None
 CHAT_DEPLOYMENT = None
 
+# -------------------------
+# Demands cache
+# -------------------------
 DEMANDS: List[Dict[str, str]] = []         # [{id, demand, description}]
-DEMAND_TOKENSETS: Dict[str, set] = {}      # id -> tokenset
-DEMAND_TEXT: Dict[str, str] = {}           # id -> "name | description_short"
+DEMAND_TEXT: Dict[str, str] = {}           # id -> "name | desc_short"
+DEMAND_NAME_RAW: Dict[str, str] = {}       # id -> demand name lower
+DEMAND_DESC_RAW: Dict[str, str] = {}       # id -> description lower
 
-# Light heuristics to prioritize lines
+DEMAND_NAME_TOKS: Dict[str, set] = {}      # id -> tokens from demand name
+DEMAND_DESC_TOKS: Dict[str, set] = {}      # id -> tokens from description
+DEMAND_ALL_TOKS: Dict[str, set] = {}       # id -> tokens from name+desc
+
+
+# -------------------------
+# Stopwords (English + domain-generic)
+# -------------------------
+_STOPWORDS_EN = {
+    "the", "and", "or", "to", "of", "in", "on", "for", "with", "a", "an", "as", "at", "by",
+    "from", "into", "over", "under", "than", "then", "that", "this", "these", "those",
+    "be", "is", "are", "was", "were", "been", "being",
+    "it", "its", "they", "them", "their", "we", "our", "you", "your",
+    "can", "could", "may", "might", "will", "would", "shall", "should", "must",
+    "need", "needs", "needed", "require", "requires", "required", "requirement",
+    "not", "no", "yes",
+}
+_STOPWORDS_DOMAIN = {
+    "system", "systems", "module", "modules", "equipment", "device", "devices", "installation",
+    "project", "contract", "supplier", "contractor", "client", "document", "documents",
+    "use", "using", "used", "provide", "provided", "including", "include",
+}
+STOPWORDS = _STOPWORDS_EN | _STOPWORDS_DOMAIN
+
+
+# -------------------------
+# Requirement heuristics (cheap gate) - EN only
+# -------------------------
 REQ_MODAL_RE = re.compile(
     r"\b(shall|must|required|requirement|should|need to|has to|may not|must not|shall not|prohibit|forbidden)\b",
     re.IGNORECASE,
 )
-REQ_PL_MODAL_RE = re.compile(
-    r"\b(musi|należy|wymaga|wymagane|powinien|powinna|zakazuje|zabrania|nie wolno|dopuszcza się|wymóg)\b",
-    re.IGNORECASE,
-)
 REQ_NUM_RE = re.compile(r"\b\d+([.,]\d+)?\b")
-UNIT_RE = re.compile(r"\b(mm|cm|m|kg|w|kw|mw|v|kv|a|ma|hz|rpm|bar|pa|°c|c|ip\d{2})\b", re.IGNORECASE)
+UNIT_RE = re.compile(r"\b(mm|cm|m|kg|w|kw|mw|v|kv|a|ma|hz|rpm|bar|pa|°c|c|ip\d{2}\b)", re.IGNORECASE)
 
 
 # -------------------------
-# IO helpers
+# Helpers
 # -------------------------
 def _json_load_maybe(x: Any) -> Any:
     if isinstance(x, (bytes, bytearray)):
@@ -83,9 +119,6 @@ def _find_content_byid(document: Dict[str, Any]) -> Dict[str, Any]:
     return by_id if isinstance(by_id, dict) else {}
 
 
-# -------------------------
-# Demands loading + index
-# -------------------------
 def _load_demands_xlsx() -> List[Dict[str, str]]:
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -118,285 +151,290 @@ def _load_demands_xlsx() -> List[Dict[str, str]]:
                 did = str(r["demand_id"]).strip()
                 if not did or did.lower() == "nan":
                     continue
-                out.append(
-                    {
-                        "id": did,
-                        "demand": str(r["demand"]).strip(),
-                        "description": str(r["description"]).strip(),
-                    }
-                )
+                out.append({"id": did, "demand": str(r["demand"]).strip(), "description": str(r["description"]).strip()})
             logger.info("Loaded %d demands from %s", len(out), p)
             return out
 
     raise RuntimeError(f"demands.xlsx not found. Tried: {candidates}")
 
 
-def _tokenize(s: str) -> set:
+def _tokenize(s: str) -> List[str]:
+    """
+    ASCII-only tokenizer: keeps a-z0-9; removes stopwords.
+    Returns list (order kept) for possible future phrase logic.
+    """
     s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9ąćęłńóśźż]+", " ", s)
-    toks = [t for t in s.split() if len(t) >= 3]
-    return set(toks)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = []
+    for t in s.split():
+        if len(t) < 3:
+            continue
+        if t in STOPWORDS:
+            continue
+        toks.append(t)
+    return toks
+
+
+def _tokset(s: str) -> set:
+    return set(_tokenize(s))
 
 
 def _build_demand_indexes():
-    global DEMAND_TOKENSETS, DEMAND_TEXT
-    DEMAND_TOKENSETS = {}
+    global DEMAND_TEXT, DEMAND_NAME_RAW, DEMAND_DESC_RAW, DEMAND_NAME_TOKS, DEMAND_DESC_TOKS, DEMAND_ALL_TOKS
+
     DEMAND_TEXT = {}
+    DEMAND_NAME_RAW = {}
+    DEMAND_DESC_RAW = {}
+    DEMAND_NAME_TOKS = {}
+    DEMAND_DESC_TOKS = {}
+    DEMAND_ALL_TOKS = {}
+
     for d in DEMANDS:
         did = d["id"]
-        name = d.get("demand", "") or ""
-        desc = d.get("description", "") or ""
-        DEMAND_TOKENSETS[did] = _tokenize(name + " " + desc)
-        desc_short = desc if len(desc) <= 240 else (desc[:240] + "…")
+        name = (d.get("demand", "") or "").strip()
+        desc = (d.get("description", "") or "").strip()
+
+        DEMAND_NAME_RAW[did] = name.lower()
+        DEMAND_DESC_RAW[did] = desc.lower()
+
+        name_toks = _tokset(name)
+        desc_toks = _tokset(desc)
+        DEMAND_NAME_TOKS[did] = name_toks
+        DEMAND_DESC_TOKS[did] = desc_toks
+        DEMAND_ALL_TOKS[did] = set(name_toks | desc_toks)
+
+        desc_short = desc if len(desc) <= 220 else (desc[:220] + "…")
         DEMAND_TEXT[did] = f"{name} | {desc_short}"
 
 
-def _candidate_retrieval(text: str, k: int) -> List[str]:
-    toks = _tokenize(text)
-    if not toks:
-        return []
-    scored: List[Tuple[str, int]] = []
-    for did, dtoks in DEMAND_TOKENSETS.items():
-        if not dtoks:
-            continue
-        overlap = len(toks & dtoks)
-        if overlap <= 0:
-            continue
-        scored.append((did, overlap))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [did for did, _ in scored[: max(1, k)]]
+def _is_requirement_fast(text: str) -> Tuple[bool, float]:
+    """
+    Conservative heuristic requirement gate (English).
+    """
+    t = (text or "").strip()
+    if len(t) < MIN_CHUNK_LEN:
+        return False, 0.0
+
+    has_modal = bool(REQ_MODAL_RE.search(t))
+    has_num = bool(REQ_NUM_RE.search(t))
+    has_unit = bool(UNIT_RE.search(t))
+
+    if has_modal and (has_num or has_unit):
+        return True, 0.85
+    if has_modal:
+        return True, 0.70
+    if has_num and has_unit:
+        return True, 0.65
+    if has_num:
+        return True, 0.60
+    return False, 0.20
 
 
-def _build_candidates_block(candidate_ids: List[str]) -> str:
-    lines = []
-    for did in candidate_ids:
-        lines.append(f"- {did}: {DEMAND_TEXT.get(did,'')}")
-    return "\n".join(lines)
-
-
-# -------------------------
-# Chunk -> lines
-# -------------------------
-def _split_lines_or_sentences(chunk_text: str) -> List[str]:
+def _split_into_sentences_or_lines(chunk_text: str) -> List[str]:
     t = (chunk_text or "").strip()
     if not t:
         return []
+
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
     tableish = (len(lines) >= 6) or any(("|" in ln or "\t" in ln) for ln in lines)
     if tableish:
         out = [ln for ln in lines if len(ln) >= MIN_CHUNK_LEN]
-        return out[:MAX_LINES_PER_CHUNK]
+        return out[:MAX_SENTENCES_PER_CHUNK]
 
     parts = re.split(r"(?<=[.!?])\s+|\n+", t)
     parts = [p.strip() for p in parts if p and p.strip()]
-    return parts[:MAX_LINES_PER_CHUNK]
+    return parts[:MAX_SENTENCES_PER_CHUNK]
 
 
-def _line_priority_score(line: str) -> float:
-    t = (line or "").strip()
-    if len(t) < MIN_CHUNK_LEN:
+def _name_phrase_hit(sentence_lower: str, did: str) -> bool:
+    """
+    Strong anchor: multiword demand name appears as phrase (case-insensitive).
+    Example: "spare parts" in sentence.
+    """
+    name = (DEMAND_NAME_RAW.get(did, "") or "").strip()
+    if not name:
+        return False
+    if " " in name and len(name) >= 6:
+        return name in sentence_lower
+    return False
+
+
+def _candidate_retrieval(sentence: str, k: int) -> List[str]:
+    """
+    Deterministic retrieval based ONLY on demand table.
+    - keep demands with token overlap >= MIN_CANDIDATE_TOKEN_OVERLAP
+    - force-include NAME phrase hits (anchors)
+    - if nothing matches -> return [] (do not fabricate candidates)
+    """
+    stoks = set(_tokenize(sentence))
+    if not stoks:
+        return []
+
+    s_lower = (sentence or "").lower()
+
+    scored: List[Tuple[str, float]] = []
+    anchors: List[str] = []
+
+    for did, all_toks in DEMAND_ALL_TOKS.items():
+        if not all_toks:
+            continue
+        overlap = len(stoks & all_toks)
+
+        if _name_phrase_hit(s_lower, did):
+            anchors.append(did)
+
+        if overlap >= MIN_CANDIDATE_TOKEN_OVERLAP:
+            scored.append((did, float(overlap)))
+
+    if not scored and not anchors:
+        return []
+
+    anchor_set = set(anchors)
+    boosted: List[Tuple[str, float]] = []
+    for did, sc in scored:
+        if did in anchor_set:
+            sc += W_NAME_PHRASE
+        boosted.append((did, sc))
+
+    for did in anchors:
+        if did not in {x[0] for x in boosted}:
+            boosted.append((did, W_NAME_PHRASE))
+
+    boosted.sort(key=lambda x: x[1], reverse=True)
+    return [did for did, _ in boosted[: max(1, k)]]
+
+
+def _score_label(sentence: str, did: str) -> Tuple[float, int, int, bool]:
+    """
+    Deterministic label scoring based ONLY on demand name+description tokens.
+    Returns:
+      (score, overlap_total, overlap_name, phrase_hit)
+    """
+    stoks = set(_tokenize(sentence))
+    if not stoks:
+        return 0.0, 0, 0, False
+
+    name_toks = DEMAND_NAME_TOKS.get(did, set())
+    desc_toks = DEMAND_DESC_TOKS.get(did, set())
+    if not name_toks and not desc_toks:
+        return 0.0, 0, 0, False
+
+    oname = len(stoks & name_toks)
+    odesc = len(stoks & desc_toks)
+    ototal = oname + odesc
+
+    phrase_hit = _name_phrase_hit((sentence or "").lower(), did)
+
+    score = W_NAME_OVERLAP * float(oname) + W_DESC_OVERLAP * float(odesc)
+    if phrase_hit:
+        score += W_NAME_PHRASE
+
+    return float(score), int(ototal), int(oname), bool(phrase_hit)
+
+
+def _prob_from_score(score: float, best: float) -> float:
+    """
+    Convert deterministic score to a pseudo-prob in [0,1].
+    Make it sharp so obvious matches reach highlight threshold.
+    """
+    if best <= 0:
         return 0.0
-    has_modal = bool(REQ_MODAL_RE.search(t) or REQ_PL_MODAL_RE.search(t))
-    has_num = bool(REQ_NUM_RE.search(t))
-    has_unit = bool(UNIT_RE.search(t))
-    if has_modal and (has_num or has_unit):
-        return 0.90
-    if has_modal:
-        return 0.75
-    if has_num and has_unit:
-        return 0.70
-    if has_num:
-        return 0.60
-    return 0.20
+    x = score / best
+    p = max(0.0, min(1.0, x ** 0.75))
+    return float(p)
 
 
-# -------------------------
-# LLM call (single-prompt solution)
-# -------------------------
-def _init_openai_client():
-    if AzureOpenAI is None:
-        raise RuntimeError("openai package not available")
+def _deterministic_predict(sentence: str, top_k: int) -> Dict[str, Any]:
+    """
+    Deterministic label assignment.
+    Never uses LLM for label selection.
+    """
+    is_req_fast, rel_fast = _is_requirement_fast(sentence)
 
-    aoai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    aoai_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    aoai_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip() or "2024-06-01"
-    deployment = (
-        os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
-        or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
-    )
+    candidate_ids = _candidate_retrieval(sentence, CANDIDATES_TOPK)
+    if not candidate_ids:
+        return {"isRequirement": bool(is_req_fast), "relevance": float(rel_fast), "labels": [], "notes": "no_candidates"}
 
-    if not (aoai_endpoint and aoai_key and deployment):
-        raise RuntimeError(
-            "Missing AOAI env vars. Need: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-            "AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT)."
-        )
+    scored: List[Tuple[str, float, int, int, bool]] = []
+    best_score = 0.0
+    for did in candidate_ids:
+        sc, ototal, oname, phrase_hit = _score_label(sentence, did)
+        best_score = max(best_score, sc)
+        scored.append((did, sc, ototal, oname, phrase_hit))
 
-    return AzureOpenAI(azure_endpoint=aoai_endpoint, api_key=aoai_key, api_version=aoai_version), deployment
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    labels_out: List[Dict[str, Any]] = []
+    for did, sc, ototal, oname, phrase_hit in scored[: max(1, top_k)]:
+        if ZERO_LEXICAL_REJECT and ototal == 0:
+            continue
+        if ototal < MIN_LABEL_TOKEN_OVERLAP:
+            continue
+
+        prob = _prob_from_score(sc, best_score)
+        if prob < LABEL_MIN_PROB:
+            continue
+
+        labels_out.append({"id": did, "probability": prob})
+
+    labels_out.sort(key=lambda x: x["probability"], reverse=True)
+    labels_out = labels_out[:MAX_LABELS_PER_CHUNK]
+
+    if not labels_out:
+        return {"isRequirement": bool(is_req_fast), "relevance": float(rel_fast), "labels": [], "notes": "no_labels_after_guards"}
+
+    rel = max(float(rel_fast), float(labels_out[0]["probability"]))
+    return {"isRequirement": bool(is_req_fast), "relevance": float(rel), "labels": labels_out, "notes": "ok"}
 
 
-def _llm_predict(sentence: str, candidate_ids: List[str], top_k: int) -> Dict[str, Any]:
+def _llm_gate(sentence: str) -> Tuple[bool, float]:
+    """
+    Optional: LLM only decides requirement gate; it does NOT select labels.
+    """
     if client is None or not CHAT_DEPLOYMENT:
-        return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "no_client"}
+        return _is_requirement_fast(sentence)
 
-    candidates_block = _build_candidates_block(candidate_ids)
-    if not candidates_block:
-        return {"isRequirement": False, "relevance": 0.0, "labels": [], "notes": "no_candidates"}
-
-    system = (
-        "You are a strict requirements classifier for bid/spec documents. "
-        "Return STRICT JSON only. No markdown. No prose. "
-        "Never invent demand IDs. "
-        "Only label when the demand DESCRIPTION conditions are satisfied."
-    )
-
+    system = "Return STRICT JSON only. No prose."
     user = f"""
-You have ONE sentence/line.
-
-STEP 1 — REQUIREMENT GATE:
-Decide if this sentence is a concrete, verifiable requirement/specification that should be highlighted.
-A requirement typically has obligation/constraint language (must/shall/należy/musi), parameters/limits (numbers/units), tests/acceptance, prohibitions, or explicit conditions.
-If not a requirement: isRequirement=false, relevance<{RELEVANCE_MIN}, labels=[].
-
-STEP 2 — LABELING (only if isRequirement=true):
-Pick up to {min(int(top_k), MAX_LABELS_PER_CHUNK)} IDs from CANDIDATES only.
-
-For EACH label:
-- probability >= {LABEL_MIN_PROB}
-- evidence: exact quote copied from the sentence (5–25 words), MUST be a substring
-- criteriaMatched: 1–3 short phrases reflecting DESCRIPTION conditions (the "WHEN")
-- If you cannot find criteria from the description that are met here, DO NOT label.
-
-CANDIDATES (id: demand | description):
-{candidates_block}
-
+Decide whether the SENTENCE contains a concrete requirement/specification that should be highlighted.
+Return JSON only:
+{{
+  "isRequirement": true|false,
+  "relevance": 0.0
+}}
 SENTENCE:
 {sentence}
-
-Return JSON ONLY:
-{{
-  "isRequirement": true,
-  "relevance": 0.0,
-  "labels": [
-    {{
-      "id": "<candidate_id>",
-      "probability": 0.0,
-      "evidence": "<exact substring from sentence>",
-      "criteriaMatched": ["<phrase1>", "<phrase2>"]
-    }}
-  ],
-  "notes": "short"
-}}
+Guidance:
+- requirement signals: must/shall/need to/has to, numbers/units, constraints, tests, prohibitions.
+- relevance 0..1. If NOT requirement, keep it < {RELEVANCE_MIN}.
 """.strip()
 
     resp = client.chat.completions.create(
         model=CHAT_DEPLOYMENT,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
-        max_tokens=900,
+        max_tokens=150,
     )
-
     raw = (resp.choices[0].message.content or "").strip()
     try:
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-# -------------------------
-# NEW: Hard post-filters (prevents nonsense labels)
-# -------------------------
-def _criteria_hits(sentence: str, criteria_list: List[str]) -> int:
-    """
-    Count how many criteria phrases have at least one meaningful token present in sentence.
-    """
-    txt = (sentence or "").lower()
-    hits = 0
-    for c in criteria_list:
-        c = (c or "").lower().strip()
-        if not c:
-            continue
-        # token-level check
-        for tok in re.split(r"\s+", c):
-            tok = tok.strip()
-            if len(tok) >= 4 and tok in txt:
-                hits += 1
-                break
-    return hits
-
-
-def _lexical_overlap(sentence: str, demand_id: str) -> int:
-    sent_toks = _tokenize(sentence)
-    dem_toks = DEMAND_TOKENSETS.get(demand_id, set())
-    return len(sent_toks & dem_toks)
-
-
-def _sanitize_llm_output(sentence: str, candidate_ids: List[str], data: Dict[str, Any], top_k: int) -> Dict[str, Any]:
-    """
-    Enforces:
-    - id must be in candidate_ids
-    - prob threshold
-    - evidence substring
-    - criteriaMatched nonempty + criteria hits in sentence
-    - lexical overlap >= OVERLAP_MIN  (KEY FIX)
-    """
-    is_req = bool(data.get("isRequirement", False))
-    try:
+        is_req = bool(data.get("isRequirement", False))
         rel = float(data.get("relevance", 0.0) or 0.0)
+        return is_req, rel
     except Exception:
-        rel = 0.0
+        return _is_requirement_fast(sentence)
 
-    labels_raw = data.get("labels", []) or []
-    labels: List[Dict[str, Any]] = []
 
-    if (not is_req) or rel < RELEVANCE_MIN or not isinstance(labels_raw, list):
-        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "gate_failed"}
-
-    for it in labels_raw[: min(int(top_k), MAX_LABELS_PER_CHUNK)]:
-        if not isinstance(it, dict):
-            continue
-
-        did = str(it.get("id", "")).strip()
-        if did not in candidate_ids:
-            continue
-
-        try:
-            prob = float(it.get("probability", 0.0) or 0.0)
-        except Exception:
-            continue
-        if prob < LABEL_MIN_PROB:
-            continue
-
-        evidence = str(it.get("evidence", "") or "").strip()
-        if not evidence or evidence.lower() not in sentence.lower():
-            continue
-
-        crit = it.get("criteriaMatched", [])
-        if not isinstance(crit, list):
-            crit = []
-        crit = [str(c).strip() for c in crit if str(c).strip()]
-        if not crit:
-            continue
-
-        # NEW: criteria must "hit" the sentence
-        if _criteria_hits(sentence, crit) < CRITERIA_HITS_MIN:
-            continue
-
-        # NEW: lexical overlap between sentence and demand tokens
-        if _lexical_overlap(sentence, did) < OVERLAP_MIN:
-            continue
-
-        labels.append({"id": did, "probability": max(0.0, min(1.0, prob))})
-
-    labels.sort(key=lambda x: x["probability"], reverse=True)
-    labels = labels[:MAX_LABELS_PER_CHUNK]
-
-    if not labels:
-        return {"isRequirement": False, "relevance": float(rel), "labels": [], "notes": "no_labels_after_filters"}
-
-    # relevance should not be below top1
-    rel = max(float(rel), float(labels[0]["probability"]))
-    return {"isRequirement": True, "relevance": float(rel), "labels": labels, "notes": "ok"}
+def _predict_sentence(sentence: str, top_k: int) -> Dict[str, Any]:
+    pred = _deterministic_predict(sentence, top_k=top_k)
+    if USE_LLM_GATE:
+        is_req, rel = _llm_gate(sentence)
+        pred["isRequirement"] = bool(is_req)
+        pred["relevance"] = float(rel)
+        if not is_req and pred.get("labels"):
+            pred["labels"] = []
+            pred["notes"] = "llm_gate_blocked"
+    return pred
 
 
 # -------------------------
@@ -410,14 +448,36 @@ def init():
     _build_demand_indexes()
 
     logger.info(
-        "init(): USE_MOCK=%s demands=%d LABEL_MIN_PROB=%.2f HIGHLIGHT_MIN_PROB=%.2f RELEVANCE_MIN=%.2f CAND_TOPK=%d OVERLAP_MIN=%d",
-        USE_MOCK, len(DEMANDS), LABEL_MIN_PROB, HIGHLIGHT_MIN_PROB, RELEVANCE_MIN, CANDIDATES_TOPK, OVERLAP_MIN
+        "init(): USE_MOCK=%s USE_LLM_GATE=%s demands=%d LABEL_MIN_PROB=%.2f HIGHLIGHT_MIN_PROB=%.2f RELEVANCE_MIN=%.2f "
+        "CANDIDATES_TOPK=%d MIN_CANDIDATE_TOKEN_OVERLAP=%d MIN_LABEL_TOKEN_OVERLAP=%d ZERO_LEXICAL_REJECT=%s",
+        USE_MOCK, USE_LLM_GATE, len(DEMANDS), LABEL_MIN_PROB, HIGHLIGHT_MIN_PROB, RELEVANCE_MIN,
+        CANDIDATES_TOPK, MIN_CANDIDATE_TOKEN_OVERLAP, MIN_LABEL_TOKEN_OVERLAP, str(ZERO_LEXICAL_REJECT)
     )
 
-    if not USE_MOCK:
-        cli, dep = _init_openai_client()
-        client = cli
-        CHAT_DEPLOYMENT = dep
+    if USE_LLM_GATE and not USE_MOCK:
+        if AzureOpenAI is None:
+            raise RuntimeError("openai package not available but USE_LLM_GATE=1")
+
+        aoai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+        aoai_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+        aoai_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip() or "2024-06-01"
+
+        CHAT_DEPLOYMENT = (
+            os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        )
+
+        if not (aoai_endpoint and aoai_key and CHAT_DEPLOYMENT):
+            raise RuntimeError(
+                "Missing AOAI env vars. Need: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_CHAT_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT)."
+            )
+
+        client = AzureOpenAI(
+            azure_endpoint=aoai_endpoint,
+            api_key=aoai_key,
+            api_version=aoai_version,
+        )
 
 
 def run(raw_data):
@@ -450,96 +510,94 @@ def run(raw_data):
         num_preds = min(num_preds, MAX_LABELS_PER_CHUNK)
 
         by_id = _find_content_byid(document)
-        best_doc_probs: Dict[str, float] = {}
 
+        best_doc_probs: Dict[str, float] = {}
         debug_left = MAX_DEBUG_CHUNKS
 
         for cid, content in by_id.items():
             if not isinstance(content, dict):
                 continue
 
-            chunk_text = str(content.get("text", "") or "").strip()
+            text = content.get("text", "")
+            chunk_text = (str(text) if text is not None else "").strip()
 
-            # Anti-crash defaults
+            # Always set expected keys/types
             content["relevantProba"] = 0.0
             content["cdTransformerPredictions"] = []
             content["cdLogregPredictions"] = []
-            # Optional: harmless if UI ignores it
             content["highlightText"] = ""
 
             if debug_left > 0:
-                logger.info("chunk=%s sample=%r", cid, chunk_text[:200])
+                logger.info("chunk=%s sample=%r", cid, chunk_text[:180])
                 debug_left -= 1
 
-            if len(chunk_text) < MIN_CHUNK_LEN:
+            sentences = _split_into_sentences_or_lines(chunk_text)
+            if not sentences:
                 continue
 
-            lines = _split_lines_or_sentences(chunk_text)
-            if not lines:
-                continue
+            # preselect likely requirements (cheap)
+            scored_sents: List[Tuple[float, str]] = []
+            for s in sentences:
+                is_req, rel_fast = _is_requirement_fast(s)
+                scored_sents.append((rel_fast if is_req else 0.0, s))
 
-            # pick best candidate lines to evaluate
-            ranked = sorted([( _line_priority_score(ln), ln) for ln in lines], key=lambda x: x[0], reverse=True)
-            candidate_lines = [ln for _, ln in ranked[:MAX_LINES_TO_LLM] if ln.strip()]
+            scored_sents.sort(key=lambda x: x[0], reverse=True)
+            candidates_for_model = [s for sc, s in scored_sents[:MAX_SENTENCES_TO_LLM] if s.strip()]
 
-            best_sentence = ""
+            best_chunk_pred: Optional[Dict[str, Any]] = None
             best_top1 = 0.0
-            best_rel = 0.0
-            best_chunk_preds: List[Dict[str, Any]] = []
+            best_sentence = ""
 
-            for sentence in candidate_lines:
-                # candidate retrieval based on sentence
-                cand_ids = _candidate_retrieval(sentence, CANDIDATES_TOPK)
-                if not cand_ids:
+            for s in candidates_for_model:
+                pred = _predict_sentence(s, top_k=num_preds)
+
+                labels = pred.get("labels", []) or []
+                if not isinstance(labels, list) or not labels:
                     continue
 
-                if USE_MOCK:
-                    # very simple mock: refuse labeling if overlap insufficient anyway
-                    data = {
-                        "isRequirement": True,
-                        "relevance": 0.8,
-                        "labels": [{"id": cand_ids[0], "probability": 0.8, "evidence": sentence[:80], "criteriaMatched": ["mock"]}],
-                    }
-                else:
-                    data = _llm_predict(sentence, cand_ids, num_preds)
+                labels_sorted = sorted(labels, key=lambda x: float(x.get("probability", 0.0) or 0.0), reverse=True)
+                top1 = float(labels_sorted[0].get("probability", 0.0) or 0.0)
 
-                sanitized = _sanitize_llm_output(sentence, cand_ids, data, num_preds)
-                if not sanitized.get("isRequirement", False):
-                    continue
-
-                rel = float(sanitized.get("relevance", 0.0) or 0.0)
-                labels = sanitized.get("labels", []) or []
-                if not labels:
-                    continue
-
-                top1 = float(labels[0]["probability"])
                 if top1 > best_top1:
                     best_top1 = top1
-                    best_rel = rel
-                    best_sentence = sentence
-                    best_chunk_preds = labels
+                    best_chunk_pred = pred
+                    best_sentence = s
 
-            # Apply highlight rule
-            if not best_chunk_preds or best_top1 < HIGHLIGHT_MIN_PROB:
+            if best_chunk_pred is None:
                 continue
 
-            # Fill UI predictions
-            ui_preds = [{"label": str(x["id"]), "proba": float(x["probability"])} for x in best_chunk_preds[:num_preds]]
-            ui_preds.sort(key=lambda x: x["proba"], reverse=True)
+            labels = best_chunk_pred.get("labels", []) or []
+            labels_sorted = sorted(labels, key=lambda x: float(x.get("probability", 0.0) or 0.0), reverse=True)
+            labels_sorted = labels_sorted[:num_preds]
 
-            content["relevantProba"] = float(max(best_rel, best_top1))
-            content["cdTransformerPredictions"] = ui_preds
-            content["cdLogregPredictions"] = list(ui_preds)  # mirror for UI selection logic
-            content["highlightText"] = best_sentence
+            final_labels = [{"label": str(lb["id"]), "proba": float(lb["probability"])} for lb in labels_sorted]
 
-            # Document-level aggregation (IDs only)
-            for p in ui_preds:
-                did = p["label"]
-                pr = float(p["proba"])
-                if did not in best_doc_probs or pr > best_doc_probs[did]:
-                    best_doc_probs[did] = pr
+            top1 = float(final_labels[0]["proba"]) if final_labels else 0.0
+            is_req = bool(best_chunk_pred.get("isRequirement", False))
+            try:
+                rel = float(best_chunk_pred.get("relevance", 0.0) or 0.0)
+            except Exception:
+                rel = 0.0
 
-        # Document-level: ARRAY OF STRINGS
+            should_highlight = bool(is_req and top1 >= HIGHLIGHT_MIN_PROB)
+
+            if should_highlight and final_labels:
+                content["relevantProba"] = float(max(rel, top1))
+                content["cdTransformerPredictions"] = final_labels
+                content["cdLogregPredictions"] = list(final_labels)
+                content["highlightText"] = best_sentence
+
+                for p in final_labels:
+                    did = p["label"]
+                    prob = float(p["proba"])
+                    if did not in best_doc_probs or prob > best_doc_probs[did]:
+                        best_doc_probs[did] = prob
+            else:
+                content["relevantProba"] = 0.0
+                content["cdTransformerPredictions"] = []
+                content["cdLogregPredictions"] = []
+                content["highlightText"] = ""
+
         ids_sorted = [k for k, v in sorted(best_doc_probs.items(), key=lambda kv: kv[1], reverse=True)]
         document["documentDemandPredictions"] = ids_sorted[:num_preds]
 
@@ -548,4 +606,5 @@ def run(raw_data):
     except Exception as e:
         logger.exception("run() failed")
         return {"error": str(e), "predictions": {"documentDemandPredictions": []}}
+
 
